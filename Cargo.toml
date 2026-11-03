@@ -27,3 +27,9 @@ log = "0.4.29"
 serde = { version = "1.0.228", default-features = false }
 
 tokio = "1.49.0"
+
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.test]
+split-debuginfo = "unpacked"

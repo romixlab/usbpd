@@ -5,6 +5,37 @@ All notable changes to the `usbpd` and `usbpd-traits` crates are documented here
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Our fork (romixlab/usbpd) for Donguru, typec_dongle FW-59. The API breaks on purpose.
+
+### `usbpd-traits`: changed (breaking)
+
+- `Driver::receive` returns an `RxFrame { sop, len }` and `Driver::transmit` takes a `Sop` (`usbpd PRL-1 sop-aware-messaging`). A driver that only handles SOP returns `Sop::Sop` and ignores the argument; our embassy fork's UCPD driver has to follow.
+- New `DriverRxError::CableReset`, `DriverRxError::Detached` and `DriverTxError::Detached` (`usbpd PRL-3 driver-detach`). Matches on these enums need the new arms.
+
+### `usbpd`: added
+
+- Message IDs per SOP: SOP' and SOP'' traffic no longer disturbs the SOP counters, GoodCRC goes out on the SOP it acknowledges, and a Cable Reset resets the cable SOPs only. `Message` has an `sop` field (`usbpd PRL-1 sop-aware-messaging`).
+- Chunked TX for extended messages over 26 bytes. EPR source caps with more than 6 PDOs now go out correctly (`usbpd PRL-2 chunked-tx`).
+- `RunResult::Detached`: on a driver detach the sink and the source reset and return; call `run()` again on the next attach (`usbpd PRL-3 driver-detach`).
+- `crate::vdm`: VDMs on any SOP go to the new `VdmDevicePolicyManager::vdm_received`, and `Event::SendVdm` sends one, in both engines (`usbpd VDM-2 vdm-dpm-hook`).
+- `VendorDefined` message type: header plus up to six VDOs, with parser and serializer (`usbpd VDM-1 total-vdm-decoding`).
+- AGENTS.md, CLAUDE.md and FEATURES.md; `just test` (nextest) and `just lint`.
+
+### `usbpd`: changed (breaking)
+
+- `SinkDpm` and `SourceDpm` require `VdmDevicePolicyManager`. An empty `impl VdmDevicePolicyManager for MyDpm {}` keeps the old behaviour (`Not_Supported`).
+- `Data::VendorDefined` holds a `VendorDefined` instead of a `(VdmHeader, Vec<u32, 7>)` tuple.
+- VDM enums have `Reserved(u8)` or `Other(u8)` variants and never panic on reserved values (`usbpd VDM-1 total-vdm-decoding`).
+- The source `Event` is no longer `Copy`.
+- `TxError` has `Detached` and `ChunkedTransmissionFailed`, and `RxError` has `Detached`.
+- The `defmt` feature also enables `usbpd-traits/defmt`.
+
+### Known limitations
+
+- The firmware examples build against upstream embassy, whose UCPD driver implements the old `Driver` trait. They need our embassy fork.
+
 ## [3.1.0] — `usbpd`
 
 ### Added
