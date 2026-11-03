@@ -265,10 +265,27 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
         self.protocol_layer = Self::new_protocol_layer(driver);
     }
 
+    /// Return to the start state after a detach, so that [`Self::run`] can be called again on the next attach.
+    fn reset_after_detach(&mut self) {
+        self.protocol_layer.reset();
+        self.state = State::Startup { role_swap: false };
+        self.contract = Contract::default();
+        self.mode = Mode::default();
+        self.hard_reset_counter.reset();
+        self.caps_counter.reset();
+    }
+
     /// Run a single step in the policy engine state machine.
     async fn run_step(&mut self) -> Result<PolicyEngineResult, Error> {
         match self.update_state().await {
             Ok(result) => Ok(result),
+            // Per the driver, the port partner is gone: stop, and start over on the next run.
+            Err(Error::Protocol(
+                ProtocolError::RxError(RxError::Detached) | ProtocolError::TxError(TxError::Detached),
+            )) => {
+                self.reset_after_detach();
+                Ok(PolicyEngineResult::Exit(RunResult::Detached))
+            }
             Err(Error::Protocol(protocol_error)) => {
                 let new_state = match (&self.mode, &self.state, protocol_error) {
                     // Handle when hard reset is signaled by the driver itself.

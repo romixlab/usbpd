@@ -610,3 +610,21 @@ async fn test_pr_swap_to_sink_startup_exits() {
         result
     );
 }
+
+#[tokio::test]
+async fn test_detach_exits_and_resets() {
+    use usbpd_traits::DriverRxError;
+
+    use crate::RunResult;
+
+    let mut policy_engine: Source<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, _> =
+        Source::new(DummyDriver::new(), DummySourceDevice {}, false);
+    // The detach arrives while waiting for the GoodCRC of Source_Capabilities.
+    policy_engine
+        .protocol_layer
+        .driver()
+        .inject_receive_error(DriverRxError::Detached);
+
+    assert!(matches!(policy_engine.run().await, Ok(RunResult::Detached)));
+    assert!(matches!(policy_engine.state, State::Startup { role_swap: false }));
+}

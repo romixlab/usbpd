@@ -638,3 +638,32 @@ async fn test_epr_mode_entry_unknown_payload_soft_resets() {
         policy_engine.state
     );
 }
+
+#[tokio::test]
+async fn test_detach_exits_and_resets() {
+    use usbpd_traits::DriverRxError;
+
+    use crate::RunResult;
+
+    let mut policy_engine: Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, _> =
+        Sink::new(DummyDriver::new(), DummySinkDevice {});
+    policy_engine
+        .protocol_layer
+        .driver()
+        .inject_receive_error(DriverRxError::Detached);
+
+    // `Discovery` -> `WaitForCapabilities`, where the detach arrives.
+    assert!(matches!(policy_engine.run().await, Ok(RunResult::Detached)));
+    assert!(matches!(policy_engine.state, State::Startup));
+    assert!(policy_engine.source_capabilities.is_none());
+
+    // The next run negotiates from scratch.
+    policy_engine
+        .protocol_layer
+        .driver()
+        .inject_received_data(&DUMMY_CAPABILITIES);
+    policy_engine.run_step().await.unwrap(); // `Startup` -> `Discovery`
+    policy_engine.run_step().await.unwrap(); // `Discovery` -> `WaitForCapabilities`
+    policy_engine.run_step().await.unwrap(); // `WaitForCapabilities` -> `EvaluateCapabilities`
+    assert!(matches!(policy_engine.state, State::EvaluateCapabilities(_)));
+}

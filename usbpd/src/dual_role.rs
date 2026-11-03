@@ -60,49 +60,45 @@ where
         let mut role_swapped = false;
 
         loop {
-            (self.driver, self.device_policy_manager) = match role {
+            let result;
+            (result, self.driver, self.device_policy_manager) = match role {
                 PowerRole::Source => {
-                    let (driver, dpm) =
-                        Self::run_source_until_swap(self.driver, self.device_policy_manager, role_swapped).await?;
-                    role = PowerRole::Sink;
-                    role_swapped = true;
-                    (driver, dpm)
+                    Self::run_source_until_swap(self.driver, self.device_policy_manager, role_swapped).await?
                 }
-                PowerRole::Sink => {
-                    let (driver, dpm) = Self::run_sink_until_swap(self.driver, self.device_policy_manager).await?;
-                    role = PowerRole::Source;
-                    role_swapped = true;
-                    (driver, dpm)
-                }
+                PowerRole::Sink => Self::run_sink_until_swap(self.driver, self.device_policy_manager).await?,
+            };
+
+            (role, role_swapped) = match result {
+                RunResult::SwapToSink => (PowerRole::Sink, true),
+                RunResult::SwapToSource => (PowerRole::Source, true),
+                // Start over in the initial role on the next attach.
+                RunResult::Detached => (initial_role, false),
             };
         }
     }
 
-    /// An `Ok(...)` result means that a power role swap to Source has been executed,
-    /// and to start running the port as a Source
-    async fn run_sink_until_swap(driver: DRIVER, device_policy_manager: DPM) -> Result<(DRIVER, DPM), Error> {
+    /// Run as a sink until a power role swap to Source or a detach.
+    async fn run_sink_until_swap(
+        driver: DRIVER,
+        device_policy_manager: DPM,
+    ) -> Result<(RunResult, DRIVER, DPM), Error> {
         let mut sink = Sink::<DRIVER, TIMER, DPM>::new_dual_role(driver, device_policy_manager);
 
-        match sink.run().await {
-            Ok(RunResult::SwapToSource) => Ok(sink.deconstruct()),
-            Err(err) => Err(Error::Sink(err)),
-            Ok(_) => unreachable!(),
-        }
+        let result = sink.run().await.map_err(Error::Sink)?;
+        let (driver, dpm) = sink.deconstruct();
+        Ok((result, driver, dpm))
     }
 
-    /// An `Ok(...)` result means that a power role swap to Sink has been executed,
-    /// and to start running the port as a Sink
+    /// Run as a source until a power role swap to Sink or a detach.
     async fn run_source_until_swap(
         driver: DRIVER,
         device_policy_manager: DPM,
         role_swapped: bool,
-    ) -> Result<(DRIVER, DPM), Error> {
+    ) -> Result<(RunResult, DRIVER, DPM), Error> {
         let mut source = Source::<DRIVER, TIMER, DPM>::new_dual_role(driver, device_policy_manager, role_swapped);
 
-        match source.run().await {
-            Ok(RunResult::SwapToSink) => Ok(source.deconstruct()),
-            Err(err) => Err(Error::Source(err)),
-            Ok(_) => unreachable!(),
-        }
+        let result = source.run().await.map_err(Error::Source)?;
+        let (driver, dpm) = source.deconstruct();
+        Ok((result, driver, dpm))
     }
 }

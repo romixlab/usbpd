@@ -200,6 +200,9 @@ pub enum RunResult {
     SwapToSource,
     /// DRP Source -> Sink
     SwapToSink,
+    /// The driver reported a detach. The policy engine is back in its start state; run it again on the next
+    /// attach.
+    Detached,
 }
 
 #[cfg(test)]

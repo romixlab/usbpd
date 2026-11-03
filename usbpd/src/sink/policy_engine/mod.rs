@@ -238,10 +238,28 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SinkDpm> Sink<DRIVER, TIMER, DPM> {
         (self.protocol_layer.deconstruct(), self.device_policy_manager)
     }
 
+    /// Return to the start state after a detach, so that [`Self::run`] can be called again on the next attach.
+    fn reset_after_detach(&mut self) {
+        self.protocol_layer.reset();
+        self.state = State::Startup;
+        self.contract = Default::default();
+        self.mode = Mode::Spr;
+        self.source_capabilities = None;
+        self.hard_reset_counter.reset();
+        self.get_source_cap_pending = false;
+    }
+
     /// Run a single step in the policy engine state machine.
     async fn run_step(&mut self) -> Result<PolicyEngineResult, Error> {
         match self.update_state().await {
             Ok(result) => Ok(result),
+            // Per the driver, the port partner is gone: stop, and start over on the next run.
+            Err(Error::Protocol(
+                ProtocolError::RxError(RxError::Detached) | ProtocolError::TxError(TxError::Detached),
+            )) => {
+                self.reset_after_detach();
+                Ok(PolicyEngineResult::Exit(RunResult::Detached))
+            }
             Err(Error::Protocol(protocol_error)) => {
                 let new_state = match (&self.mode, &self.state, protocol_error) {
                     (_, State::DrpSwap(SwapState::FastPower(_)), _) => {
