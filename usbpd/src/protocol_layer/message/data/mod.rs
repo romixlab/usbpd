@@ -4,7 +4,6 @@
 use core::mem::size_of;
 
 use byteorder::{ByteOrder, LittleEndian};
-use heapless::Vec;
 
 use crate::protocol_layer::message::Payload;
 use crate::protocol_layer::message::header::DataMessageType;
@@ -56,12 +55,10 @@ pub enum Data {
     /// Used to enter, acknowledge or exit EPR mode.
     #[cfg(feature = "epr")]
     EprMode(epr_mode::EprModeDataObject),
-    /// Vendor defined messages (VDM), per PD 3.2 Sec. 6.4.9.
+    /// Vendor defined messages (VDM), per PD 3.2 Sec. 6.4.4.
     ///
-    /// Currently parsed from the wire but not forwarded to user applications.
-    // TODO: Add DevicePolicyManager callback to allow applications to handle
-    // vendor-specific messages.
-    VendorDefined((vendor_defined::VdmHeader, Vec<u32, 7>)),
+    /// The policy engines forward them to the device policy manager (see [`crate::vdm`]).
+    VendorDefined(vendor_defined::VendorDefined),
     /// Unknown data type.
     Unknown,
 }
@@ -136,49 +133,13 @@ impl Data {
                     Data::EprMode(epr_mode::EprModeDataObject(LittleEndian::read_u32(payload)))
                 }
             }
-            DataMessageType::VendorDefined => {
-                // Keep for now...
-                if len < PDO_SIZE {
-                    Data::Unknown
-                } else {
-                    let num_obj = message.header.num_objects();
-                    trace!("VENDOR: {:?}, {:?}, {:?}", len, num_obj, payload);
-
-                    let header = {
-                        let raw = vendor_defined::VdmHeaderRaw(LittleEndian::read_u32(&payload[..PDO_SIZE]));
-                        match raw.vdm_type() {
-                            vendor_defined::VdmType::Unstructured => {
-                                vendor_defined::VdmHeader::Unstructured(vendor_defined::VdmHeaderUnstructured(raw.0))
-                            }
-                            vendor_defined::VdmType::Structured => {
-                                vendor_defined::VdmHeader::Structured(vendor_defined::VdmHeaderStructured(raw.0))
-                            }
-                        }
-                    };
-
-                    let data = payload[PDO_SIZE..]
-                        .as_chunks::<PDO_SIZE>()
-                        .0
-                        .iter()
-                        .take(7)
-                        .map(|buf| LittleEndian::read_u32(buf))
-                        .collect::<Vec<u32, 7>>();
-
-                    trace!("VDM RX: {:?} {:?}", header, data);
-                    // trace!("HEADER: VDM:: TYPE: {:?}, VERS: {:?}", header.vdm_type(),
-                    // header.vdm_version()); trace!("HEADER: CMD:: TYPE: {:?}, CMD:
-                    // {:?}", header.command_type(), header.command());
-
-                    // Keep for now...
-                    // let pkt = payload
-                    //     .chunks_exact(1)
-                    //     .take(8)
-                    //     .map(|i| i[0])
-                    //     .collect::<Vec<u8, 8>>();
-
-                    Data::VendorDefined((header, data))
+            DataMessageType::VendorDefined => match vendor_defined::VendorDefined::parse(payload, message.header.num_objects()) {
+                Some(vdm) => {
+                    trace!("VDM RX: {:?}", vdm);
+                    Data::VendorDefined(vdm)
                 }
-            }
+                None => Data::Unknown,
+            },
             _ => {
                 warn!("Unhandled message type");
                 Data::Unknown
@@ -205,7 +166,7 @@ impl Data {
                 LittleEndian::write_u32(payload, *data_object);
                 PDO_SIZE
             }
-            Self::VendorDefined(_) => unimplemented!(),
+            Self::VendorDefined(vdm) => vdm.to_bytes(payload),
         }
     }
 }

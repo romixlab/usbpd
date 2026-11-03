@@ -1,6 +1,87 @@
-//! Definitions of vendor defined data message content.
+//! Definitions of vendor defined data message content, per PD 3.2 Sec. 6.4.4.
+//!
+//! Every conversion from raw bits is total: reserved or unknown values decode to a `Reserved` or `Other`
+//! variant that keeps the raw value, so a malformed VDM from the port partner can never panic.
 use byteorder::{ByteOrder, LittleEndian};
+use heapless::Vec;
 use proc_bitfield::bitfield;
+
+/// Size of a VDM header or VDO in bytes.
+const VDO_SIZE: usize = core::mem::size_of::<u32>();
+
+/// Maximum number of VDOs that follow the VDM header (7 data objects in total, per PD 3.2 Sec. 6.4.4).
+pub const MAX_VDOS: usize = 6;
+
+/// The PD standard ID (PD SID), used for Discover Identity/SVIDs and other generic structured VDMs.
+pub const PD_SID: u16 = 0xFF00;
+
+/// The DisplayPort standard ID.
+pub const DISPLAYPORT_SID: u16 = 0xFF01;
+
+/// A Vendor_Defined message: a VDM header and up to six VDOs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VendorDefined {
+    /// The VDM header, structured or unstructured.
+    pub header: VdmHeader,
+    /// The VDOs that follow the header.
+    pub vdos: Vec<u32, MAX_VDOS>,
+}
+
+impl VendorDefined {
+    /// Create a VDM from a header and VDOs. VDOs beyond [`MAX_VDOS`] are dropped.
+    pub fn new(header: VdmHeader, vdos: &[u32]) -> Self {
+        Self {
+            header,
+            vdos: vdos.iter().take(MAX_VDOS).copied().collect(),
+        }
+    }
+
+    /// Number of data objects in the message (the header plus the VDOs).
+    pub fn num_objects(&self) -> u8 {
+        1 + self.vdos.len() as u8
+    }
+
+    /// Parse a VDM from a data message payload. `num_objects` comes from the message header.
+    ///
+    /// Returns `None` if the payload holds no VDM header.
+    pub fn parse(payload: &[u8], num_objects: usize) -> Option<Self> {
+        if payload.len() < VDO_SIZE || num_objects == 0 {
+            return None;
+        }
+
+        let header = VdmHeader::from(LittleEndian::read_u32(&payload[..VDO_SIZE]));
+        let vdos = payload[VDO_SIZE..]
+            .as_chunks::<VDO_SIZE>()
+            .0
+            .iter()
+            .take((num_objects - 1).min(MAX_VDOS))
+            .map(|buf| LittleEndian::read_u32(buf))
+            .collect();
+
+        Some(Self { header, vdos })
+    }
+
+    /// Serialize the VDM to a slice, returning the number of written bytes.
+    pub fn to_bytes(&self, buf: &mut [u8]) -> usize {
+        LittleEndian::write_u32(buf, self.header.into());
+        let mut offset = VDO_SIZE;
+        for vdo in &self.vdos {
+            LittleEndian::write_u32(&mut buf[offset..], *vdo);
+            offset += VDO_SIZE;
+        }
+        offset
+    }
+
+    /// The structured VDM header, if this is a structured VDM.
+    pub fn structured(&self) -> Option<VdmHeaderStructured> {
+        match self.header {
+            VdmHeader::Structured(header) => Some(header),
+            VdmHeader::Unstructured(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -36,7 +117,8 @@ impl From<VendorDataObject> for u32 {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Structured VDM command type, per PD 3.2 Tab. 6.29. All four values of the 2-bit field are defined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VdmCommandType {
     InitiatorREQ,
@@ -58,18 +140,20 @@ impl From<VdmCommandType> for u8 {
 
 impl From<u8> for VdmCommandType {
     fn from(value: u8) -> Self {
-        match value {
+        match value & 0b11 {
             0 => VdmCommandType::InitiatorREQ,
             1 => VdmCommandType::ResponderACK,
             2 => VdmCommandType::ResponderNAK,
-            3 => VdmCommandType::ResponderBSY,
-            _ => panic!("Cannot convert {} to VdmCommandType", value), /* Illegal values shall
-                                                                        * panic. */
+            _ => VdmCommandType::ResponderBSY,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Structured VDM command, per PD 3.2 Tab. 6.29.
+///
+/// Commands 16..=31 are SVID specific; `DisplayPortStatus` and `DisplayPortConfig` are the DisplayPort ones.
+/// Everything else decodes to `Other` with the raw 5-bit value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VdmCommand {
     DiscoverIdentity,
@@ -80,6 +164,8 @@ pub enum VdmCommand {
     Attention,
     DisplayPortStatus,
     DisplayPortConfig,
+    /// A reserved or SVID-specific command not listed above.
+    Other(u8),
 }
 
 impl From<VdmCommand> for u8 {
@@ -93,6 +179,7 @@ impl From<VdmCommand> for u8 {
             VdmCommand::Attention => 0x6,
             VdmCommand::DisplayPortStatus => 0x10,
             VdmCommand::DisplayPortConfig => 0x11,
+            VdmCommand::Other(raw) => raw & 0x1F,
         }
     }
 }
@@ -108,13 +195,12 @@ impl From<u8> for VdmCommand {
             0x06 => VdmCommand::Attention,
             0x10 => VdmCommand::DisplayPortStatus,
             0x11 => VdmCommand::DisplayPortConfig,
-            // TODO: Find document that explains what 0x12-0x1f are (DP_SID??)
-            _ => panic!("Cannot convert {} to VdmCommand", value), // Illegal values shall panic.
+            other => VdmCommand::Other(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VdmType {
     Unstructured,
@@ -139,7 +225,7 @@ impl From<bool> for VdmType {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VdmHeader {
@@ -152,6 +238,14 @@ impl VdmHeader {
         match self {
             VdmHeader::Structured(header) => header.to_bytes(buf),
             VdmHeader::Unstructured(header) => header.to_bytes(buf),
+        }
+    }
+
+    /// The SVID (structured) or vendor ID (unstructured) of the VDM.
+    pub fn standard_or_vid(self) -> u16 {
+        match self {
+            VdmHeader::Structured(header) => header.standard_or_vid(),
+            VdmHeader::Unstructured(header) => header.standard_or_vid(),
         }
     }
 }
@@ -218,6 +312,21 @@ impl VdmHeaderStructured {
     pub fn to_bytes(self, buf: &mut [u8]) {
         LittleEndian::write_u32(buf, self.0);
     }
+
+    /// A structured VDM header for SVID `svid`, version 2.1, with the given command and command type.
+    pub fn new(svid: u16, command: VdmCommand, command_type: VdmCommandType) -> Self {
+        Self::default()
+            .with_standard_or_vid(svid)
+            .with_vdm_version_major(VdmVersionMajor::Version2x.into())
+            .with_vdm_version_minor(VdmVersionMinor::Version21.into())
+            .with_command(command)
+            .with_command_type(command_type)
+    }
+
+    /// The header of a response to this request: same SVID, version, object position and command.
+    pub fn response(self, command_type: VdmCommandType) -> Self {
+        self.with_command_type(command_type)
+    }
 }
 
 impl Default for VdmHeaderStructured {
@@ -226,11 +335,13 @@ impl Default for VdmHeaderStructured {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VdmVersionMajor {
     Version10,
     Version2x,
+    /// A reserved value.
+    Reserved(u8),
 }
 
 impl From<VdmVersionMajor> for u8 {
@@ -238,6 +349,7 @@ impl From<VdmVersionMajor> for u8 {
         match value {
             VdmVersionMajor::Version10 => 0b00,
             VdmVersionMajor::Version2x => 0b01,
+            VdmVersionMajor::Reserved(raw) => raw & 0b11,
         }
     }
 }
@@ -247,16 +359,18 @@ impl From<u8> for VdmVersionMajor {
         match value {
             0b00 => VdmVersionMajor::Version10,
             0b01 => VdmVersionMajor::Version2x,
-            _ => panic!("Cannot convert {} to VdmVersionMajor", value), // Illegal values shall panic.
+            other => VdmVersionMajor::Reserved(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VdmVersionMinor {
     Version20,
     Version21,
+    /// A reserved value.
+    Reserved(u8),
 }
 
 impl From<VdmVersionMinor> for u8 {
@@ -264,6 +378,7 @@ impl From<VdmVersionMinor> for u8 {
         match value {
             VdmVersionMinor::Version20 => 0b00,
             VdmVersionMinor::Version21 => 0b01,
+            VdmVersionMinor::Reserved(raw) => raw & 0b11,
         }
     }
 }
@@ -273,8 +388,7 @@ impl From<u8> for VdmVersionMinor {
         match value {
             0b00 => VdmVersionMinor::Version20,
             0b01 => VdmVersionMinor::Version21,
-            _ => panic!("Cannot convert {} to VdmVersionMinor", value), /* Illegal values shall
-                                                                         * panic. */
+            other => VdmVersionMinor::Reserved(other),
         }
     }
 }
@@ -326,13 +440,15 @@ impl VdmIdentityHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SopProductTypeUfp {
     NotUFP,
     PdUsbHub,
     PdUsbPeripheral,
     Psd,
+    /// A reserved value, or a cable plug type when the header came from SOP'/SOP''.
+    Reserved(u8),
 }
 
 impl From<SopProductTypeUfp> for u8 {
@@ -342,6 +458,7 @@ impl From<SopProductTypeUfp> for u8 {
             SopProductTypeUfp::PdUsbHub => 0b001,
             SopProductTypeUfp::PdUsbPeripheral => 0b010,
             SopProductTypeUfp::Psd => 0b011,
+            SopProductTypeUfp::Reserved(raw) => raw & 0b111,
         }
     }
 }
@@ -353,20 +470,20 @@ impl From<u8> for SopProductTypeUfp {
             0b001 => SopProductTypeUfp::PdUsbHub,
             0b010 => SopProductTypeUfp::PdUsbPeripheral,
             0b011 => SopProductTypeUfp::Psd,
-
-            _ => panic!("Cannot convert {} to SopProductTypeUfp", value), /* Illegal values
-                                                                           * shall panic. */
+            other => SopProductTypeUfp::Reserved(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SopProductTypeDfp {
     NotDFP,
     PDUSBHub,
     PDUSBHost,
     PowerBrick,
+    /// A reserved value.
+    Reserved(u8),
 }
 
 impl From<SopProductTypeDfp> for u8 {
@@ -376,6 +493,7 @@ impl From<SopProductTypeDfp> for u8 {
             SopProductTypeDfp::PDUSBHub => 0b001,
             SopProductTypeDfp::PDUSBHost => 0b010,
             SopProductTypeDfp::PowerBrick => 0b011,
+            SopProductTypeDfp::Reserved(raw) => raw & 0b111,
         }
     }
 }
@@ -387,16 +505,18 @@ impl From<u8> for SopProductTypeDfp {
             0b001 => SopProductTypeDfp::PDUSBHub,
             0b010 => SopProductTypeDfp::PDUSBHost,
             0b011 => SopProductTypeDfp::PowerBrick,
-
-            _ => panic!("Cannot convert {} to SopProductTypeDfp", value), /* Illegal values
-                                                                           * shall panic. */
+            other => SopProductTypeDfp::Reserved(other),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ConnectorType {
     USBTypeCReceptacle,
     USBTypeCPlug,
+    /// A reserved value (`00b` is used by PD 2.0 and 3.0 partners, which do not fill the field).
+    Reserved(u8),
 }
 
 impl From<ConnectorType> for u8 {
@@ -404,6 +524,7 @@ impl From<ConnectorType> for u8 {
         match value {
             ConnectorType::USBTypeCReceptacle => 0b10,
             ConnectorType::USBTypeCPlug => 0b11,
+            ConnectorType::Reserved(raw) => raw & 0b11,
         }
     }
 }
@@ -413,10 +534,11 @@ impl From<u8> for ConnectorType {
         match value {
             0b10 => ConnectorType::USBTypeCReceptacle,
             0b11 => ConnectorType::USBTypeCPlug,
-            _ => panic!("Cannot convert {} to ConnectorType", value), // Illegal values shall panic.
+            other => ConnectorType::Reserved(other),
         }
     }
 }
+
 bitfield! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -469,7 +591,7 @@ impl UFPTypeVDO {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum USBHighestSpeed {
     USB20Only,
@@ -477,6 +599,8 @@ pub enum USBHighestSpeed {
     USB32Gen2,
     USB40Gen3,
     USB40Gen4,
+    /// A reserved value.
+    Reserved(u8),
 }
 
 impl From<USBHighestSpeed> for u8 {
@@ -487,6 +611,7 @@ impl From<USBHighestSpeed> for u8 {
             USBHighestSpeed::USB32Gen2 => 0b010,
             USBHighestSpeed::USB40Gen3 => 0b011,
             USBHighestSpeed::USB40Gen4 => 0b100,
+            USBHighestSpeed::Reserved(raw) => raw & 0b111,
         }
     }
 }
@@ -499,12 +624,12 @@ impl From<u8> for USBHighestSpeed {
             0b010 => USBHighestSpeed::USB32Gen2,
             0b011 => USBHighestSpeed::USB40Gen3,
             0b100 => USBHighestSpeed::USB40Gen4,
-            _ => panic!("Cannot convert {} to USBHighestSpeed", value), // Illegal values shall panic.
+            other => USBHighestSpeed::Reserved(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum VconnPower {
     P1W,
@@ -514,6 +639,8 @@ pub enum VconnPower {
     P4W,
     P5W,
     P6W,
+    /// A reserved value.
+    Reserved(u8),
 }
 
 impl From<VconnPower> for u8 {
@@ -526,6 +653,7 @@ impl From<VconnPower> for u8 {
             VconnPower::P4W => 0b100,
             VconnPower::P5W => 0b101,
             VconnPower::P6W => 0b110,
+            VconnPower::Reserved(raw) => raw & 0b111,
         }
     }
 }
@@ -540,21 +668,24 @@ impl From<u8> for VconnPower {
             0b100 => VconnPower::P4W,
             0b101 => VconnPower::P5W,
             0b110 => VconnPower::P6W,
-            _ => panic!("Cannot convert {} to VconnPower", value), // Illegal values shall panic.
+            other => VconnPower::Reserved(other),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UFPVDOVersion {
     Version1_3,
+    /// Any other version value.
+    Other(u8),
 }
 
 impl From<UFPVDOVersion> for u8 {
     fn from(value: UFPVDOVersion) -> Self {
         match value {
             UFPVDOVersion::Version1_3 => 0b011,
+            UFPVDOVersion::Other(raw) => raw & 0b111,
         }
     }
 }
@@ -563,7 +694,7 @@ impl From<u8> for UFPVDOVersion {
     fn from(value: u8) -> Self {
         match value {
             0b011 => UFPVDOVersion::Version1_3,
-            _ => panic!("Cannot convert {} to UFPVDOVersion", value), // Illegal values shall panic.
+            other => UFPVDOVersion::Other(other),
         }
     }
 }
@@ -590,5 +721,69 @@ bitfield! {
 impl DisplayPortCapabilities {
     pub fn to_bytes(self, buf: &mut [u8]) {
         LittleEndian::write_u32(buf, self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every raw value of every decoded field converts without panicking, and known values round-trip.
+    #[test]
+    fn all_raw_values_decode() {
+        for raw in 0..=u8::MAX {
+            let _ = VdmCommandType::from(raw);
+            let _ = SopProductTypeUfp::from(raw & 0b111);
+            let _ = SopProductTypeDfp::from(raw & 0b111);
+            let _ = ConnectorType::from(raw & 0b11);
+            let _ = USBHighestSpeed::from(raw & 0b111);
+            let _ = VconnPower::from(raw & 0b111);
+            let _ = UFPVDOVersion::from(raw & 0b111);
+            let _ = VdmVersionMajor::from(raw & 0b11);
+            let _ = VdmVersionMinor::from(raw & 0b11);
+            let command = VdmCommand::from(raw & 0x1F);
+            assert_eq!(u8::from(command), raw & 0x1F);
+        }
+    }
+
+    /// Bit patterns that used to panic in the getters (reserved commands, connector type 00b) now decode.
+    #[test]
+    fn reserved_getters_do_not_panic() {
+        let header = VdmHeaderStructured(0xFF00_8000 | 0x1F);
+        assert_eq!(header.command(), VdmCommand::Other(0x1F));
+
+        let id = VdmIdentityHeader(0xFFFF_FFFF);
+        assert_eq!(id.product_type_ufp(), SopProductTypeUfp::Reserved(0b111));
+        assert_eq!(id.product_type_dfp(), SopProductTypeDfp::Reserved(0b111));
+        assert_eq!(VdmIdentityHeader(0).connector_type(), ConnectorType::Reserved(0));
+    }
+
+    #[test]
+    fn vendor_defined_round_trip() {
+        let header = VdmHeaderStructured::new(PD_SID, VdmCommand::DiscoverIdentity, VdmCommandType::ResponderACK);
+        let vdm = VendorDefined::new(VdmHeader::Structured(header), &[1, 2, 3]);
+        assert_eq!(vdm.num_objects(), 4);
+
+        let mut buf = [0u8; 28];
+        let len = vdm.to_bytes(&mut buf);
+        assert_eq!(len, 16);
+
+        let parsed = VendorDefined::parse(&buf[..len], 4).unwrap();
+        assert_eq!(parsed, vdm);
+        let structured = parsed.structured().unwrap();
+        assert_eq!(structured.command(), VdmCommand::DiscoverIdentity);
+        assert_eq!(structured.command_type(), VdmCommandType::ResponderACK);
+        assert_eq!(structured.standard_or_vid(), PD_SID);
+    }
+
+    #[test]
+    fn vendor_defined_parse_limits() {
+        assert!(VendorDefined::parse(&[0, 0], 1).is_none());
+        // More objects claimed than present: only what is there is read.
+        let buf = [0u8; 12];
+        assert_eq!(VendorDefined::parse(&buf, 7).unwrap().vdos.len(), 2);
+        // Never more than six VDOs.
+        let buf = [0u8; 40];
+        assert_eq!(VendorDefined::parse(&buf, 7).unwrap().vdos.len(), MAX_VDOS);
     }
 }
