@@ -39,7 +39,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         let header = Header::new_extended(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             ExtendedMessageType::EprSourceCapabilities,
             0, // num_objects is 0 for extended messages
         );
@@ -54,7 +54,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     pub async fn transmit_epr_mode(&mut self, action: epr_mode::Action, data: u8) -> Result<(), ProtocolError> {
         let header = Header::new_data(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             DataMessageType::EprMode,
             1,
         );
@@ -80,7 +80,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         let header = Header::new_extended(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             ExtendedMessageType::EprSinkCapabilities,
             0, // num_objects is Reserved (0) for unchunked extended messages per spec 6.2.1.1.2
         );

@@ -23,13 +23,14 @@ use message::data::{Data, request};
 #[cfg(any(feature = "epr", test))]
 use message::extended::extended_control::ExtendedControlMessageType;
 use message::header::{ControlMessageType, DataMessageType, ExtendedMessageType, Header, MessageType};
-use usbpd_traits::{Driver, DriverRxError, DriverTxError};
+use usbpd_traits::{Driver, DriverRxError, DriverTxError, Sop};
 
 use crate::PowerRole;
 use crate::counters::{Counter, CounterType, Error as CounterError};
 use crate::protocol_layer::message::data::source_capabilities::SourceCapabilities;
 #[cfg(any(feature = "epr", test))]
 use crate::protocol_layer::message::extended::Extended;
+use crate::protocol_layer::message::extended::chunked::{MAX_EXTENDED_MSG_CHUNK_LEN, MAX_EXTENDED_MSG_LEN};
 use crate::protocol_layer::message::{ParseError, Payload};
 use crate::timers::{Timer, TimerType};
 
@@ -87,6 +88,9 @@ pub enum RxError {
     /// The received acknowledgement does not match the last transmitted message's ID.
     #[error("wrong tx id `{0}` acknowledged")]
     AcknowledgeMismatch(u8),
+    /// The driver reported that the port partner detached.
+    #[error("detached")]
+    Detached,
 }
 
 /// Errors that can occur during transmission of data.
@@ -96,12 +100,36 @@ pub enum TxError {
     /// Driver reported a hard reset.
     #[error("hard reset")]
     HardReset,
+    /// The driver reported that the port partner detached.
+    #[error("detached")]
+    Detached,
     /// unchunked_extended_messages_supported must be false (library uses chunked mode).
     #[error("unchunked extended messages not supported")]
     UnchunkedExtendedMessagesNotSupported,
     /// AVS voltage LSB 2 bits must be zero per PD 3.2 Tab. 6.26.
     #[error("AVS voltage alignment invalid")]
     AvsVoltageAlignmentInvalid,
+    /// A chunked extended message was not sent completely: the receiver requested a wrong chunk, stopped
+    /// requesting chunks, or sent another message in between (per PD 3.2 Sec. 6.12.2.1.3.8).
+    #[error("chunked transmission failed")]
+    ChunkedTransmissionFailed,
+}
+
+/// Message ID state of one SOP, per PD 3.2 Sec. 6.7.1: each SOP* has its own `MessageIDCounter` and stored
+/// `MessageID`.
+#[derive(Debug, Clone, Copy)]
+struct SopCounters {
+    rx_message: Option<Counter>,
+    tx_message: Counter,
+}
+
+impl Default for SopCounters {
+    fn default() -> Self {
+        Self {
+            rx_message: None,
+            tx_message: Counter::new(CounterType::MessageId),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -109,8 +137,7 @@ struct Counters {
     _busy: Counter,
     _caps: Counter, // Unused, optional.
     _discover_identity: Counter,
-    rx_message: Option<Counter>,
-    tx_message: Counter,
+    sop: [SopCounters; Sop::COUNT],
     retry: Counter,
 }
 
@@ -120,10 +147,19 @@ impl Default for Counters {
             _busy: Counter::new(CounterType::Busy),
             _caps: Counter::new(CounterType::Caps),
             _discover_identity: Counter::new(CounterType::DiscoverIdentity),
-            rx_message: None,
-            tx_message: Counter::new(CounterType::MessageId),
+            sop: [SopCounters::default(); Sop::COUNT],
             retry: Counter::new(CounterType::Retry),
         }
+    }
+}
+
+impl Counters {
+    fn of(&self, sop: Sop) -> &SopCounters {
+        &self.sop[sop.index()]
+    }
+
+    fn of_mut(&mut self, sop: Sop) -> &mut SopCounters {
+        &mut self.sop[sop.index()]
     }
 }
 
@@ -191,12 +227,38 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         self.driver
     }
 
-    /// Reset the protocol layer.
+    /// Reset the protocol layer, for all SOPs.
     pub fn reset(&mut self) {
         self.counters = Default::default();
         self.pending_rx.clear();
         // Half-assembled chunked messages must not survive a layer reset.
         self.reset_chunked_rx();
+    }
+
+    /// Reset the message ID state of the cable SOPs (SOP', SOP'' and their debug variants), as after a Cable Reset
+    /// (per PD 3.2 Sec. 6.7.1).
+    pub fn reset_cable(&mut self) {
+        for sop in Sop::ALL.into_iter().filter(|sop| sop.is_cable()) {
+            *self.counters.of_mut(sop) = SopCounters::default();
+        }
+    }
+
+    /// The SOP `MessageIDCounter`, for building message headers.
+    ///
+    /// [`transmit`](Self::transmit) stamps the counter of the message's SOP into its header anyway.
+    fn tx_counter(&self) -> Counter {
+        self.counters.of(Sop::Sop).tx_message
+    }
+
+    /// The header template for messages sent with `sop`.
+    ///
+    /// Per PD 3.2 Sec. 6.2.1.1.4 and 6.2.1.1.7, in SOP'/SOP'' messages bit 8 is the Cable Plug flag (0: sent by a
+    /// port) and bit 5 is reserved, so both are cleared.
+    fn header_template(&self, sop: Sop) -> Header {
+        match sop {
+            Sop::Sop => self.default_header,
+            _ => Header(self.default_header.0 & !((1 << 8) | (1 << 5))),
+        }
     }
 
     /// Allows tests to access the driver directly.
@@ -225,14 +287,29 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         loop {
             let mut buffer = Self::get_message_buffer();
 
-            let length = match self.driver.receive(&mut buffer).await {
-                Ok(length) => length,
-                Err(DriverRxError::Discarded) => continue,
-                Err(DriverRxError::HardReset) => return Err(RxError::HardReset),
+            let Some(frame) = self.driver_receive(&mut buffer).await? else {
+                continue;
             };
 
-            let message = Message::from_bytes(&buffer[..length])?;
+            let message = Message::from_bytes(&buffer[..frame.len])?.with_sop(frame.sop);
             return Ok(message);
+        }
+    }
+
+    /// Receive one frame from the driver.
+    ///
+    /// Returns `Ok(None)` for frames to skip: discarded ones, and a Cable Reset (which resets the cable SOPs).
+    async fn driver_receive(&mut self, buffer: &mut [u8]) -> Result<Option<usbpd_traits::RxFrame>, RxError> {
+        match self.driver.receive(buffer).await {
+            Ok(frame) => Ok(Some(frame)),
+            Err(DriverRxError::Discarded) => Ok(None),
+            Err(DriverRxError::CableReset) => {
+                trace!("Cable Reset received");
+                self.reset_cable();
+                Ok(None)
+            }
+            Err(DriverRxError::HardReset) => Err(RxError::HardReset),
+            Err(DriverRxError::Detached) => Err(RxError::Detached),
         }
     }
 
@@ -242,7 +319,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     /// transmit state machine, so a port partner may transmit while this port
     /// awaits GoodCRC. Such messages are acknowledged and parked for later
     /// delivery instead of aborting the wait (per PD 3.2 Sec. 6.12.2.2.1.5, Tab. 8.2).
-    async fn wait_for_good_crc(&mut self) -> Result<(), RxError> {
+    ///
+    /// Only a GoodCRC with the SOP of our own transmission (`sop`) acknowledges it.
+    async fn wait_for_good_crc(&mut self, sop: Sop) -> Result<(), RxError> {
         trace!("Wait for GoodCrc");
 
         let timeout_fut = Self::get_timer(TimerType::CRCReceive);
@@ -254,15 +333,20 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     message.header.message_type(),
                     MessageType::Control(ControlMessageType::GoodCRC)
                 ) {
+                    if message.sop != sop {
+                        trace!("Ignoring GoodCrc for {:?} while waiting on {:?}", message.sop, sop);
+                        continue;
+                    }
+                    let tx_message = &mut self.counters.of_mut(sop).tx_message;
                     trace!(
                         "Received GoodCrc, TX message count: {}, expected: {}",
                         message.header.message_id(),
-                        self.counters.tx_message.value()
+                        tx_message.value()
                     );
-                    if message.header.message_id() == self.counters.tx_message.value() {
+                    if message.header.message_id() == tx_message.value() {
                         // Per PD 3.2 Sec. 6.7.1.1
+                        _ = tx_message.increment();
                         self.counters.retry.reset();
-                        _ = self.counters.tx_message.increment();
                         return Ok(());
                     } else {
                         return Err(RxError::AcknowledgeMismatch(message.header.message_id()));
@@ -292,9 +376,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     /// Per PD 3.2 Sec. 6.2.1.1.5, the sender of a GoodCRC Message Shall set the Specification Revision field to match the
     /// revision of the message being acknowledged. Adopt the received revision before acknowledging.
     async fn park_received_message(&mut self, message: Message) -> Result<(), RxError> {
-        if let Ok(revision) = message.header.spec_revision() {
-            self.default_header = self.default_header.with_spec_revision(revision);
-        }
+        self.adopt_spec_revision(&message);
 
         match self.handle_rx_ack(&message).await {
             Ok(true) => Ok(()),
@@ -303,6 +385,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 Ok(())
             }
             Err(RxError::HardReset) => Err(RxError::HardReset),
+            Err(RxError::Detached) => Err(RxError::Detached),
             Err(_) => {
                 trace!("Failed to acknowledge parked message");
                 Ok(())
@@ -342,11 +425,23 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         Ok(())
     }
 
-    async fn transmit_inner(&mut self, buffer: &[u8]) -> Result<(), TxError> {
+    /// Adopt the specification revision of a received SOP message (per PD 3.2 Sec. 6.2.1.1.5).
+    ///
+    /// Cable messages do not change the revision used with the port partner.
+    fn adopt_spec_revision(&mut self, message: &Message) {
+        if message.sop == Sop::Sop
+            && let Ok(revision) = message.header.spec_revision()
+        {
+            self.default_header = self.default_header.with_spec_revision(revision);
+        }
+    }
+
+    async fn transmit_inner(&mut self, sop: Sop, buffer: &[u8]) -> Result<(), TxError> {
         loop {
-            match self.driver.transmit(buffer).await {
+            match self.driver.transmit(sop, buffer).await {
                 Ok(_) => return Ok(()),
                 Err(DriverTxError::HardReset) => return Err(TxError::HardReset),
+                Err(DriverTxError::Detached) => return Err(TxError::Detached),
                 Err(DriverTxError::Discarded) => {
                     // Retry transmission.
                 }
@@ -354,11 +449,25 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         }
     }
 
-    /// Transmit a message.
+    /// Stamp the per-SOP `MessageIDCounter` into a header, and clear the port-only bits for cable SOPs.
+    fn stamp_header(&self, header: Header, sop: Sop) -> Header {
+        let template = self.header_template(sop);
+        // Keep the message type, object count and extended flag; take roles and revision from the template.
+        const PORT_ONLY_BITS: u16 = (1 << 8) | (1 << 5);
+        let header = match sop {
+            Sop::Sop => header,
+            _ => Header((header.0 & !PORT_ONLY_BITS) | (template.0 & PORT_ONLY_BITS)),
+        };
+        header.with_message_id(self.counters.of(sop).tx_message.value())
+    }
+
+    /// Transmit a message with the SOP set in `message.sop`.
+    ///
+    /// Extended messages longer than one chunk (26 bytes) are sent in chunks, per PD 3.2 Sec. 6.12.2.1.3.
     ///
     // GoodCrc message transmission is handled separately.
     // See `transmit_good_crc()` instead.
-    pub async fn transmit(&mut self, message: Message) -> Result<(), ProtocolError> {
+    pub async fn transmit(&mut self, mut message: Message) -> Result<(), ProtocolError> {
         assert_ne!(
             message.header.message_type(),
             MessageType::Control(ControlMessageType::GoodCRC)
@@ -369,26 +478,185 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         trace!("Transmit message: {:?}", message);
 
+        let sop = message.sop;
         let mut buffer = Self::get_message_buffer();
-        let size = message.to_bytes(&mut buffer);
 
+        let size = match &message.payload {
+            Some(Payload::Extended(extended)) => {
+                let mut data = [0u8; MAX_EXTENDED_MSG_LEN];
+                let data_size = extended.to_bytes(&mut data);
+                if data_size > MAX_EXTENDED_MSG_CHUNK_LEN {
+                    return self.transmit_chunked(message.header, sop, &data[..data_size]).await;
+                }
+                Self::chunk_to_bytes(
+                    self.stamp_header(message.header, sop),
+                    data_size,
+                    0,
+                    &data[..data_size],
+                    &mut buffer,
+                )
+            }
+            _ => {
+                message.header = self.stamp_header(message.header, sop);
+                message.to_bytes(&mut buffer)
+            }
+        };
+
+        self.transmit_frame(sop, &buffer[..size]).await
+    }
+
+    /// Serialize one chunk of an extended message: the message header with the chunk's object count, the
+    /// extended header and the chunk data, padded to a whole data object (per PD 3.2 Sec. 6.2.1.2).
+    ///
+    /// Returns the number of bytes written.
+    fn chunk_to_bytes(header: Header, data_size: usize, chunk_number: u8, chunk: &[u8], buffer: &mut [u8]) -> usize {
+        let num_objects = (EXT_HEADER_SIZE + chunk.len()).div_ceil(4);
+        let ext_header = message::extended::ExtendedHeader::new(data_size as u16)
+            .with_chunked(true)
+            .with_chunk_number(chunk_number);
+
+        let mut offset = header.with_num_objects(num_objects as u8).to_bytes(buffer);
+        offset += ext_header.to_bytes(&mut buffer[offset..]);
+        buffer[offset..offset + chunk.len()].copy_from_slice(chunk);
+        let end = MSG_HEADER_SIZE + num_objects * 4;
+        buffer[offset + chunk.len()..end].fill(0);
+        end
+    }
+
+    /// Send an extended message of more than one chunk, per PD 3.2 Sec. 6.12.2.1.3 (Chunked Tx state machine).
+    ///
+    /// After each chunk but the last, the receiver must request the next one within tChunkSenderRequest.
+    /// If no Chunk Request follows chunk 0, the partner does not do chunking and the message counts as sent
+    /// (it answers `Not_Supported`, a cable plug ignores the message).
+    async fn transmit_chunked(&mut self, header: Header, sop: Sop, data: &[u8]) -> Result<(), ProtocolError> {
+        let MessageType::Extended(message_type) = header.message_type() else {
+            unreachable!("only extended messages are chunked");
+        };
+        let chunk_count = data.len().div_ceil(MAX_EXTENDED_MSG_CHUNK_LEN);
+
+        for chunk_number in 0..chunk_count {
+            let start = chunk_number * MAX_EXTENDED_MSG_CHUNK_LEN;
+            let end = (start + MAX_EXTENDED_MSG_CHUNK_LEN).min(data.len());
+
+            let mut buffer = Self::get_message_buffer();
+            let size = Self::chunk_to_bytes(
+                self.stamp_header(header, sop),
+                data.len(),
+                chunk_number as u8,
+                &data[start..end],
+                &mut buffer,
+            );
+            trace!("Transmit chunk {} of {} for {:?}", chunk_number, chunk_count, message_type);
+            self.transmit_frame(sop, &buffer[..size]).await?;
+
+            if chunk_number + 1 == chunk_count {
+                break;
+            }
+
+            match self.wait_for_chunk_request(sop, message_type).await? {
+                Some(requested) if requested as usize == chunk_number + 1 => {}
+                Some(requested) => {
+                    trace!("Chunk {} requested, expected {}", requested, chunk_number + 1);
+                    return Err(TxError::ChunkedTransmissionFailed.into());
+                }
+                None if chunk_number == 0 => {
+                    trace!("No chunk request after chunk 0: partner does not support chunking");
+                    return Ok(());
+                }
+                None => return Err(TxError::ChunkedTransmissionFailed.into()),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Wait for a Chunk Request for an extended message of `message_type` on `sop`.
+    ///
+    /// Returns the requested chunk number, or `None` when tChunkSenderRequest expired. Any other message aborts
+    /// the chunked transmission: it is parked for the policy engine and the transmission fails.
+    async fn wait_for_chunk_request(
+        &mut self,
+        sop: Sop,
+        message_type: ExtendedMessageType,
+    ) -> Result<Option<u8>, ProtocolError> {
+        let timeout_fut = Self::get_timer(TimerType::ChunkSenderRequest);
+        let receive_fut = async {
+            loop {
+                let mut buffer = Self::get_message_buffer();
+                let Some(frame) = self.driver_receive(&mut buffer).await? else {
+                    continue;
+                };
+                if frame.len < MSG_HEADER_SIZE {
+                    continue;
+                }
+
+                // Per PD 3.2 Sec. 6.6.1, a corrupt header is dropped.
+                let Ok(header) = Header::from_bytes(&buffer[..MSG_HEADER_SIZE]) else {
+                    continue;
+                };
+                if matches!(
+                    header.message_type(),
+                    MessageType::Control(ControlMessageType::GoodCRC)
+                ) {
+                    continue;
+                }
+
+                let probe = Message::new(header).with_sop(frame.sop);
+                if self.handle_rx_ack(&probe).await? {
+                    continue; // Retransmission
+                }
+
+                if frame.sop == sop
+                    && header.message_type() == MessageType::Extended(message_type)
+                    && frame.len >= MSG_HEADER_SIZE + EXT_HEADER_SIZE
+                {
+                    let ext_header = message::extended::ExtendedHeader::from_bytes(
+                        &buffer[MSG_HEADER_SIZE..MSG_HEADER_SIZE + EXT_HEADER_SIZE],
+                    );
+                    if ext_header.request_chunk() {
+                        return Ok(Some(ext_header.chunk_number()));
+                    }
+                }
+
+                // Per PD 3.2 Sec. 6.12.2.1.3.8: any other message ends the chunked transmission and goes to the
+                // receive path. It was acknowledged above.
+                if let Ok(message) = Message::from_bytes(&buffer[..frame.len]) {
+                    let message = message.with_sop(frame.sop);
+                    self.adopt_spec_revision(&message);
+                    self.pending_rx.push(message);
+                }
+                return Err(TxError::ChunkedTransmissionFailed.into());
+            }
+        };
+
+        match select(timeout_fut, receive_fut).await {
+            Either::First(_) => Ok(None),
+            Either::Second(result) => result,
+        }
+    }
+
+    /// Transmit one frame and wait for its GoodCRC, retrying per PD 3.2 Sec. 6.7.2.
+    ///
+    /// The frame's header must carry the current `MessageIDCounter` of `sop` (see [`Self::stamp_header`]).
+    async fn transmit_frame(&mut self, sop: Sop, frame: &[u8]) -> Result<(), ProtocolError> {
         if DRIVER::HAS_AUTO_RETRY {
             // Hardware handles retries and verifies GoodCRC reception.
             // Call driver.transmit() directly (not transmit_inner()) because
             // Discarded here means all hardware retries exhausted — no point
             // retrying in software.
-            match self.driver.transmit(&buffer[..size]).await {
+            match self.driver.transmit(sop, frame).await {
                 Ok(()) => {
                     self.counters.retry.reset();
-                    _ = self.counters.tx_message.increment();
+                    _ = self.counters.of_mut(sop).tx_message.increment();
                     trace!("Transmit success (hardware retry)");
                     Ok(())
                 }
                 Err(DriverTxError::HardReset) => Err(TxError::HardReset.into()),
+                Err(DriverTxError::Detached) => Err(TxError::Detached.into()),
                 Err(DriverTxError::Discarded) => {
                     // Per PD 3.2 Sec. 6.12.2.2.1.9 (`PRL_Tx_Transmission_Error`): increment the `MessageIDCounter` and
                     // inform the Policy Engine of the transmission error, so the partner's stored ID is not reused.
-                    _ = self.counters.tx_message.increment();
+                    _ = self.counters.of_mut(sop).tx_message.increment();
                     Err(ProtocolError::TransmitRetriesExceeded(self.counters.retry.max_value()))
                 }
             }
@@ -397,8 +665,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             self.counters.retry.reset();
 
             loop {
-                match self.transmit_inner(&buffer[..size]).await {
-                    Ok(_) => match self.wait_for_good_crc().await {
+                match self.transmit_inner(sop, frame).await {
+                    Ok(_) => match self.wait_for_good_crc(sop).await {
                         Ok(()) => {
                             trace!("Transmit success");
                             return Ok(());
@@ -411,7 +679,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                                 Err(CounterError::Exceeded) => {
                                     // Per PD 3.2 Sec. 6.12.2.2.1.9 (PRL_Tx_Transmission_Error): increment the `MessageIDCounter`
                                     // and inform the Policy Engine of the transmission error, so the partner's stored ID is not reused.
-                                    let _ = self.counters.tx_message.increment();
+                                    let _ = self.counters.of_mut(sop).tx_message.increment();
                                     return Err(ProtocolError::TransmitRetriesExceeded(
                                         self.counters.retry.max_value(),
                                     ));
@@ -426,23 +694,27 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         }
     }
 
-    /// Send a GoodCrc message to the port partner.
-    async fn transmit_good_crc(&mut self) -> Result<(), ProtocolError> {
-        trace!(
-            "Transmit message GoodCrc for RX message count: {}",
-            self.counters.rx_message.unwrap().value()
-        );
+    /// Send a GoodCrc message acknowledging `received`, on its SOP.
+    ///
+    /// Per PD 3.2 Sec. 6.2.1.1.5, the GoodCRC carries the specification revision of the message it acknowledges.
+    async fn transmit_good_crc(&mut self, received: &Message) -> Result<(), ProtocolError> {
+        let message_id = received.header.message_id();
+        trace!("Transmit message GoodCrc for RX message count: {}", message_id);
+
+        let mut template = self.header_template(received.sop);
+        if let Ok(revision) = received.header.spec_revision() {
+            template = template.with_spec_revision(revision);
+        }
 
         let mut buffer = Self::get_message_buffer();
-
         let size = Message::new(Header::new_control(
-            self.default_header,
-            self.counters.rx_message.unwrap(), // A message must have been received before.
+            template,
+            Counter::new_from_value(CounterType::MessageId, message_id),
             ControlMessageType::GoodCRC,
         ))
         .to_bytes(&mut buffer);
 
-        Ok(self.transmit_inner(&buffer[..size]).await?)
+        Ok(self.transmit_inner(received.sop, &buffer[..size]).await?)
     }
 
     /// Handle acknowledgement and retransmission detection for a received message.
@@ -462,9 +734,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         };
 
         if !DRIVER::HAS_AUTO_GOOD_CRC && !is_good_crc {
-            match self.transmit_good_crc().await {
+            match self.transmit_good_crc(message).await {
                 Ok(()) => {}
                 Err(ProtocolError::TxError(TxError::HardReset)) => return Err(RxError::HardReset),
+                Err(ProtocolError::TxError(TxError::Detached)) => return Err(RxError::Detached),
                 Err(_) => return Err(RxError::UnsupportedMessage),
             }
         }
@@ -487,7 +760,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             // chunk assembly and the acknowledgement pipeline. Only post-parse checks are repeated.
             // Update of spec revision is mirrored here.
             if let Some(message) = self.pending_rx.pop() {
-                self.default_header = self.default_header.with_spec_revision(message.header.spec_revision()?);
+                self.adopt_spec_revision(&message);
 
                 match message.header.message_type() {
                     MessageType::Control(ControlMessageType::Reserved)
@@ -495,7 +768,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                         trace!("Unsupported message type in header: {:?}", message.header);
                         return Err(RxError::UnsupportedMessage);
                     }
-                    MessageType::Control(ControlMessageType::SoftReset) => return Err(RxError::SoftReset),
+                    MessageType::Control(ControlMessageType::SoftReset) if message.sop == Sop::Sop => {
+                        return Err(RxError::SoftReset);
+                    }
                     _ => (),
                 }
 
@@ -505,11 +780,13 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
             let mut buffer = Self::get_message_buffer();
 
-            let length = match self.driver.receive(&mut buffer).await {
-                Ok(length) => length,
-                Err(DriverRxError::Discarded) => continue,
-                Err(DriverRxError::HardReset) => return Err(RxError::HardReset),
+            let Some(frame) = self.driver_receive(&mut buffer).await? else {
+                continue;
             };
+            let (sop, length) = (frame.sop, frame.len);
+            if length < MSG_HEADER_SIZE {
+                continue;
+            }
 
             // Parse header early to handle chunking.
             let header = Header::from_bytes(&buffer[..MSG_HEADER_SIZE])?;
@@ -517,6 +794,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
             if matches!(message_type, MessageType::Extended(_)) {
                 let ext_header_end = MSG_HEADER_SIZE + EXT_HEADER_SIZE;
+                if length < ext_header_end {
+                    continue;
+                }
                 let ext_header =
                     message::extended::ExtendedHeader::from_bytes(&buffer[MSG_HEADER_SIZE..ext_header_end]);
                 let payload = &buffer[ext_header_end..length];
@@ -529,7 +809,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 };
 
                 // Update specification revision, based on the received frame.
-                self.default_header = self.default_header.with_spec_revision(header.spec_revision()?);
+                header.spec_revision()?;
+                self.adopt_spec_revision(&Message::new(header).with_sop(sop));
 
                 if chunked {
                     trace!(
@@ -540,7 +821,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     );
 
                     // Update RX counters and acknowledge.
-                    let tmp_message = Message { header, payload: None };
+                    let tmp_message = Message::new(header).with_sop(sop);
                     if self.handle_rx_ack(&tmp_message).await? {
                         continue; // Retransmission
                     }
@@ -579,7 +860,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                             .as_ref()
                             .map(|(_, _, next)| *next)
                             .unwrap_or(1);
-                        self.transmit_chunk_request(msg_type, next_chunk).await?;
+                        self.transmit_chunk_request(sop, msg_type, next_chunk).await?;
                         continue;
                     }
 
@@ -601,7 +882,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                     };
 
                     self.extended_rx_expected = None;
-                    let mut message = Message::new(header);
+                    let mut message = Message::new(header).with_sop(sop);
                     message.payload = Some(parsed_payload);
 
                     trace!("Received assembled extended message {:?}", message);
@@ -610,15 +891,24 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             }
 
             // Non-extended or unchunked extended messages.
-            let message = Message::from_bytes(&buffer[..length])?;
+            let message = Message::from_bytes(&buffer[..length])?.with_sop(sop);
 
             // Update specification revision, based on the received frame.
-            self.default_header = self.default_header.with_spec_revision(message.header.spec_revision()?);
+            self.adopt_spec_revision(&message);
 
             match message.header.message_type() {
                 MessageType::Control(ControlMessageType::Reserved) | MessageType::Data(DataMessageType::Reserved) => {
                     trace!("Unsupported message type in header: {:?}", message.header);
                     return Err(RxError::UnsupportedMessage);
+                }
+                MessageType::Control(ControlMessageType::SoftReset) if sop.is_cable() => {
+                    // A Soft_Reset to a cable plug resets that SOP only (per PD 3.2 Sec. 6.7.1), and goes up as a
+                    // message to whoever plays the cable plug.
+                    *self.counters.of_mut(sop) = SopCounters::default();
+                    match self.handle_rx_ack(&message).await? {
+                        true => continue,
+                        false => return Ok(message),
+                    }
                 }
                 MessageType::Control(ControlMessageType::SoftReset) => {
                     // Per PD 3.2 Sec. 6.12.2.3.2/.3: reset the `MessageIDCounter` and clear the stored `MessageID` in
@@ -660,13 +950,14 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     ///
     /// Returns `true`, if this was a retransmission.
     fn update_rx_message_counter(&mut self, rx_message: &Message) -> bool {
-        match self.counters.rx_message.as_mut() {
+        let rx_counter = &mut self.counters.of_mut(rx_message.sop).rx_message;
+        match rx_counter.as_mut() {
             None => {
                 trace!(
                     "Received first message after protocol layer reset with RX counter value: {}",
                     rx_message.header.message_id()
                 );
-                self.counters.rx_message = Some(Counter::new_from_value(
+                *rx_counter = Some(Counter::new_from_value(
                     CounterType::MessageId,
                     rx_message.header.message_id(),
                 ));
@@ -684,7 +975,9 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         }
     }
 
-    /// Wait until a message of one of the chosen types is received, or a timeout occurs.
+    /// Wait until a SOP message of one of the chosen types is received, or a timeout occurs.
+    ///
+    /// Messages on other SOPs (cable traffic) are acknowledged and dropped: the policy engine waits on its partner.
     pub async fn receive_message_type(
         &mut self,
         message_types: &[MessageType],
@@ -705,6 +998,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                             message.header.message_type(),
                             MessageType::Control(ControlMessageType::GoodCRC)
                         ) {
+                            continue;
+                        }
+                        if message.sop != Sop::Sop {
+                            trace!("Dropping {:?} message while waiting for SOP", message.sop);
                             continue;
                         }
                         return if message_types.contains(&message.header.message_type()) {
@@ -746,6 +1043,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         loop {
             match self.driver.transmit_hard_reset().await {
                 Ok(_) | Err(DriverTxError::HardReset) => break,
+                Err(DriverTxError::Detached) => return Err(TxError::Detached.into()),
                 Err(DriverTxError::Discarded) => (),
             }
         }
@@ -763,7 +1061,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     pub async fn transmit_control_message(&mut self, message_type: ControlMessageType) -> Result<(), ProtocolError> {
         let message = Message::new(Header::new_control(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             message_type,
         ));
 
@@ -780,7 +1078,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         // ExtendedControl = 2-byte extended header + 2-byte data = 4 bytes = 1 data object.
         let mut message = Message::new(Header::new_extended(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             ExtendedMessageType::ExtendedControl,
             1,
         ));
@@ -799,6 +1097,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
     /// - Extended header with: chunked=1, request_chunk=1, chunk_number=requested_chunk, data_size=0
     async fn transmit_chunk_request(
         &mut self,
+        sop: Sop,
         message_type: ExtendedMessageType,
         chunk_number: u8,
     ) -> Result<(), RxError> {
@@ -811,7 +1110,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
             .with_chunk_number(chunk_number);
 
         // Build message header - num_objects = 1 for the extended header word
-        let header = Header::new_extended(self.default_header, self.counters.tx_message, message_type, 1);
+        let header = self.stamp_header(
+            Header::new_extended(self.default_header, self.tx_counter(), message_type, 1),
+            sop,
+        );
 
         // Build message bytes manually
         let mut buffer = Self::get_message_buffer();
@@ -822,25 +1124,12 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         // Buffer is already zeroed, so just advance offset.
         offset += 2;
 
-        // Transmit and wait for GoodCRC
-        if DRIVER::HAS_AUTO_RETRY {
-            match self.driver.transmit(&buffer[..offset]).await {
-                Ok(()) => {
-                    self.counters.retry.reset();
-                    _ = self.counters.tx_message.increment();
-                    Ok(())
-                }
-                Err(DriverTxError::HardReset) => Err(RxError::HardReset),
-                Err(DriverTxError::Discarded) => Err(RxError::ReceiveTimeout),
-            }
-        } else {
-            match self.transmit_inner(&buffer[..offset]).await {
-                Ok(_) => self.wait_for_good_crc().await,
-                Err(TxError::HardReset) => Err(RxError::HardReset),
-                Err(TxError::UnchunkedExtendedMessagesNotSupported | TxError::AvsVoltageAlignmentInvalid) => {
-                    unreachable!("validation should happen before transmit_inner")
-                }
-            }
+        match self.transmit_frame(sop, &buffer[..offset]).await {
+            Ok(()) => Ok(()),
+            Err(ProtocolError::RxError(error)) => Err(error),
+            Err(ProtocolError::TxError(TxError::HardReset)) => Err(RxError::HardReset),
+            Err(ProtocolError::TxError(TxError::Detached)) => Err(RxError::Detached),
+            Err(_) => Err(RxError::ReceiveTimeout),
         }
     }
 
@@ -856,7 +1145,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         let num_objects = capabilities.num_objects();
         let header = Header::new_data(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             DataMessageType::SinkCapabilities,
             num_objects,
         );
@@ -882,7 +1171,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
         let header = Header::new_data(
             self.default_header,
-            self.counters.tx_message,
+            self.tx_counter(),
             DataMessageType::SourceCapabilities,
             source_capabilities.0.len() as u8, // Raw cast OK since since len has domain of [0, 8]
         );
@@ -944,7 +1233,7 @@ impl<DRIVER: Driver, TIMER: Timer> SinkProtocolLayer<DRIVER, TIMER> {
 
         let message_type = power_source_request.message_type();
         let num_objects = power_source_request.num_objects();
-        let header = Header::new_data(self.default_header, self.counters.tx_message, message_type, num_objects);
+        let header = Header::new_data(self.default_header, self.tx_counter(), message_type, num_objects);
 
         self.transmit(Message::new_with_data(header, Data::Request(power_source_request)))
             .await
@@ -1258,5 +1547,310 @@ mod tests {
         assert_eq!(Some(2), pending.pop().map(|message| message.header.message_id()));
         assert_eq!(Some(3), pending.pop().map(|message| message.header.message_id()));
         assert!(pending.queue.is_empty());
+    }
+
+    /// Build a frame for any SOP: a control message `raw_type` with `message_id`, from a sink UFP at rev 3.x.
+    fn control_bytes(raw_type: u16, message_id: u8) -> [u8; 2] {
+        let header = raw_type | ((message_id as u16) << 9) | (0b10 << 6);
+        [(header & 0xFF) as u8, (header >> 8) as u8]
+    }
+
+    #[tokio::test]
+    async fn test_sop_prime_has_its_own_message_ids() {
+        use usbpd_traits::Sop;
+
+        use super::message::header::{ControlMessageType, MessageType};
+
+        let mut protocol_layer = get_protocol_layer(DummyDriver::new());
+
+        // A SOP and a SOP' message with the same MessageID: neither is a retransmission of the other.
+        protocol_layer.driver.inject_received_data(&source_caps_bytes(3));
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &control_bytes(0b0_0011, 3)); // Accept
+        // A SOP' retransmission is dropped.
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &control_bytes(0b0_0011, 3));
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &control_bytes(0b0_0011, 4));
+
+        let first = protocol_layer.receive_message().await.unwrap();
+        assert_eq!(first.sop, Sop::Sop);
+        let second = protocol_layer.receive_message().await.unwrap();
+        assert_eq!(second.sop, Sop::SopPrime);
+        assert_eq!(second.header.message_id(), 3);
+        let third = protocol_layer.receive_message().await.unwrap();
+        assert_eq!(third.sop, Sop::SopPrime);
+        assert_eq!(third.header.message_id(), 4);
+
+        // Every frame, the retransmission too, was acknowledged on its own SOP.
+        let expected = [(Sop::Sop, 3), (Sop::SopPrime, 3), (Sop::SopPrime, 3), (Sop::SopPrime, 4)];
+        for (sop, message_id) in expected {
+            let (tx_sop, frame) = protocol_layer.driver.probe_transmitted_sop_data();
+            let ack = super::message::Message::from_bytes(&frame).unwrap();
+            assert_eq!(tx_sop, sop);
+            assert_eq!(ack.header.message_type(), MessageType::Control(ControlMessageType::GoodCRC));
+            assert_eq!(ack.header.message_id(), message_id);
+        }
+        assert!(!protocol_layer.driver.has_transmitted_data());
+    }
+
+    #[tokio::test]
+    async fn test_sop_prime_transmit_uses_cable_header_and_counter() {
+        use usbpd_traits::Sop;
+
+        let mut protocol_layer = ProtocolLayer::<_, DummyTimer>::new(
+            DummyDriver::<MAX_DATA_MESSAGE_SIZE>::new(),
+            Header::new_template(
+                crate::DataRole::Dfp,
+                crate::PowerRole::Source,
+                super::message::header::SpecificationRevision::R3_X,
+            ),
+        );
+
+        // A SOP GoodCRC does not acknowledge a SOP' transmission; the SOP' one does.
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(0));
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &good_crc_bytes(0));
+        protocol_layer
+            .transmit(transmit_get_source_cap_message().with_sop(Sop::SopPrime))
+            .await
+            .unwrap();
+
+        let (sop, frame) = protocol_layer.driver.probe_transmitted_sop_data();
+        assert_eq!(sop, Sop::SopPrime);
+        let header = super::message::Message::from_bytes(&frame).unwrap().header;
+        // Cable Plug bit (8) and the reserved bit 5 are clear for a port's SOP' message.
+        assert_eq!(header.0 & ((1 << 8) | (1 << 5)), 0);
+        assert_eq!(header.message_id(), 0);
+        assert!(!protocol_layer.driver.has_transmitted_data());
+
+        // The SOP' counter moved on, the SOP one did not.
+        assert_eq!(protocol_layer.counters.of(Sop::SopPrime).tx_message.value(), 1);
+        assert_eq!(protocol_layer.counters.of(Sop::Sop).tx_message.value(), 0);
+
+        // A SOP transmission keeps the port roles.
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(0));
+        let message = super::message::Message::new(Header::new_control(
+            *protocol_layer.header(),
+            protocol_layer.tx_counter(),
+            super::message::header::ControlMessageType::GetSinkCap,
+        ));
+        protocol_layer.transmit(message).await.unwrap();
+        let (sop, frame) = protocol_layer.driver.probe_transmitted_sop_data();
+        assert_eq!(sop, Sop::Sop);
+        let header = super::message::Message::from_bytes(&frame).unwrap().header;
+        assert_eq!(header.0 & ((1 << 8) | (1 << 5)), (1 << 8) | (1 << 5));
+    }
+
+    #[tokio::test]
+    async fn test_cable_reset_resets_cable_ids_only() {
+        use usbpd_traits::{DriverRxError, Sop};
+
+        let mut protocol_layer = get_protocol_layer(DummyDriver::new());
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &control_bytes(0b0_0011, 5));
+        protocol_layer.driver.inject_receive_error(DriverRxError::CableReset);
+        // Same ID after the Cable Reset: a new message, not a retransmission.
+        protocol_layer
+            .driver
+            .inject_received_sop_data(Sop::SopPrime, &control_bytes(0b0_0011, 5));
+
+        assert_eq!(protocol_layer.receive_message().await.unwrap().header.message_id(), 5);
+        assert_eq!(protocol_layer.receive_message().await.unwrap().header.message_id(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_detach_is_reported() {
+        use usbpd_traits::DriverRxError;
+
+        use super::{ProtocolError, RxError};
+
+        let mut protocol_layer = get_protocol_layer(DummyDriver::new());
+        protocol_layer.driver.inject_receive_error(DriverRxError::Detached);
+        assert!(matches!(
+            protocol_layer.receive_message().await,
+            Err(ProtocolError::RxError(RxError::Detached))
+        ));
+
+        // Also while waiting for GoodCRC.
+        protocol_layer.driver.inject_receive_error(DriverRxError::Detached);
+        assert!(matches!(
+            protocol_layer.transmit(transmit_get_source_cap_message()).await,
+            Err(ProtocolError::RxError(RxError::Detached))
+        ));
+    }
+
+    #[test]
+    fn test_chunk_to_bytes_pads_to_data_objects() {
+        let header = Header::new_template(
+            crate::DataRole::Ufp,
+            crate::PowerRole::Sink,
+            super::message::header::SpecificationRevision::R3_X,
+        );
+        let mut buffer = [0xFFu8; 32];
+        let size = ProtocolLayer::<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer>::chunk_to_bytes(
+            header,
+            30,
+            1,
+            &[1, 2, 3, 4],
+            &mut buffer,
+        );
+        // Header (2) + extended header (2) + 4 data bytes, padded to 2 data objects.
+        assert_eq!(size, 10);
+        assert_eq!(Header(u16::from_le_bytes([buffer[0], buffer[1]])).num_objects(), 2);
+        assert_eq!(&buffer[4..10], &[1, 2, 3, 4, 0, 0]);
+    }
+
+    /// Chunk request from the sink for `chunk_number` of an `EPR_Source_Capabilities`.
+    #[cfg(feature = "epr")]
+    fn epr_caps_chunk_request_bytes(message_id: u8, chunk_number: u8) -> [u8; 6] {
+        use crate::protocol_layer::message::extended::ExtendedHeader;
+        use crate::protocol_layer::message::header::ExtendedMessageType;
+
+        let header = Header::new_extended(
+            Header::new_template(
+                crate::DataRole::Ufp,
+                crate::PowerRole::Sink,
+                super::message::header::SpecificationRevision::R3_X,
+            ),
+            crate::counters::Counter::new_from_value(crate::counters::CounterType::MessageId, message_id),
+            ExtendedMessageType::EprSourceCapabilities,
+            1,
+        );
+        let ext_header = ExtendedHeader::new(0)
+            .with_chunked(true)
+            .with_request_chunk(true)
+            .with_chunk_number(chunk_number);
+        let mut buffer = [0u8; 6];
+        let offset = header.to_bytes(&mut buffer);
+        ext_header.to_bytes(&mut buffer[offset..]);
+        buffer
+    }
+
+    /// The 10 PDOs of the captured chunked `EPR_Source_Capabilities` fixture.
+    #[cfg(feature = "epr")]
+    fn captured_epr_source_capabilities() -> SourceCapabilities {
+        use crate::dummy::{DUMMY_EPR_SOURCE_CAPS_CHUNK_0, DUMMY_EPR_SOURCE_CAPS_CHUNK_1};
+        use crate::protocol_layer::message::Message;
+        use crate::protocol_layer::message::extended::Extended;
+        use crate::protocol_layer::message::extended::chunked::{ChunkResult, ChunkedMessageAssembler};
+        use crate::protocol_layer::message::header::ExtendedMessageType;
+
+        let mut assembler = ChunkedMessageAssembler::new();
+        for chunk in [&DUMMY_EPR_SOURCE_CAPS_CHUNK_0[..], &DUMMY_EPR_SOURCE_CAPS_CHUNK_1[..]] {
+            let (header, ext_header, data) = Message::parse_extended_chunk(chunk).unwrap();
+            if let ChunkResult::Complete(data) = assembler.process_chunk(header, ext_header, data).unwrap() {
+                let Extended::EprSourceCapabilities(pdos) =
+                    Message::parse_extended_payload(ExtendedMessageType::EprSourceCapabilities, &data)
+                else {
+                    panic!("not EPR source capabilities");
+                };
+                return SourceCapabilities(pdos.into_iter().collect());
+            }
+        }
+        panic!("fixture did not assemble");
+    }
+
+    #[cfg(feature = "epr")]
+    fn get_source_protocol_layer() -> ProtocolLayer<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer> {
+        ProtocolLayer::new(
+            DummyDriver::new(),
+            Header::new_template(
+                crate::DataRole::Dfp,
+                crate::PowerRole::Source,
+                super::message::header::SpecificationRevision::R3_X,
+            ),
+        )
+    }
+
+    /// Sending the captured 40-byte EPR caps reproduces both captured chunks byte for byte.
+    #[cfg(feature = "epr")]
+    #[tokio::test]
+    async fn test_chunked_transmit_matches_capture() {
+        use usbpd_traits::Sop;
+
+        use crate::dummy::{DUMMY_EPR_SOURCE_CAPS_CHUNK_0, DUMMY_EPR_SOURCE_CAPS_CHUNK_1};
+
+        let caps = captured_epr_source_capabilities();
+        assert_eq!(caps.0.len(), 10);
+
+        let mut protocol_layer = get_source_protocol_layer();
+        // The capture has MessageIDs 6 and 7.
+        protocol_layer.counters.of_mut(Sop::Sop).tx_message =
+            crate::counters::Counter::new_from_value(crate::counters::CounterType::MessageId, 6);
+
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(6));
+        protocol_layer
+            .driver
+            .inject_received_data(&epr_caps_chunk_request_bytes(2, 1));
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(7));
+
+        protocol_layer.transmit_epr_source_capabilities(&caps).await.unwrap();
+
+        let chunk_0 = protocol_layer.driver.probe_transmitted_data();
+        assert_eq!(&chunk_0[..], &DUMMY_EPR_SOURCE_CAPS_CHUNK_0[..]);
+        // GoodCRC for the chunk request.
+        let ack = protocol_layer.driver.probe_transmitted_data();
+        assert_eq!(super::message::Message::from_bytes(&ack).unwrap().header.message_id(), 2);
+        let chunk_1 = protocol_layer.driver.probe_transmitted_data();
+        assert_eq!(&chunk_1[..], &DUMMY_EPR_SOURCE_CAPS_CHUNK_1[..]);
+        assert!(!protocol_layer.driver.has_transmitted_data());
+        assert_eq!(protocol_layer.counters.of(Sop::Sop).tx_message.value(), 0);
+    }
+
+    /// Without a chunk request after chunk 0, the message counts as sent (the partner does not chunk).
+    #[cfg(feature = "epr")]
+    #[tokio::test]
+    async fn test_chunked_transmit_without_chunk_request() {
+        let caps = captured_epr_source_capabilities();
+        let mut protocol_layer = get_source_protocol_layer();
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(0));
+
+        protocol_layer.transmit_epr_source_capabilities(&caps).await.unwrap();
+        protocol_layer.driver.probe_transmitted_data();
+        assert!(!protocol_layer.driver.has_transmitted_data());
+    }
+
+    /// A wrong chunk number fails the transmission.
+    #[cfg(feature = "epr")]
+    #[tokio::test]
+    async fn test_chunked_transmit_wrong_chunk_request() {
+        use super::{ProtocolError, TxError};
+
+        let caps = captured_epr_source_capabilities();
+        let mut protocol_layer = get_source_protocol_layer();
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(0));
+        protocol_layer
+            .driver
+            .inject_received_data(&epr_caps_chunk_request_bytes(0, 3));
+
+        assert!(matches!(
+            protocol_layer.transmit_epr_source_capabilities(&caps).await,
+            Err(ProtocolError::TxError(TxError::ChunkedTransmissionFailed))
+        ));
+    }
+
+    /// Another message in place of the chunk request aborts the transmission and is delivered afterwards.
+    #[cfg(feature = "epr")]
+    #[tokio::test]
+    async fn test_chunked_transmit_interrupted_by_message() {
+        use super::{ProtocolError, TxError};
+
+        let caps = captured_epr_source_capabilities();
+        let mut protocol_layer = get_source_protocol_layer();
+        protocol_layer.driver.inject_received_data(&good_crc_bytes(0));
+        protocol_layer.driver.inject_received_data(&control_bytes(0b0_0111, 4)); // Get_Source_Cap
+
+        assert!(matches!(
+            protocol_layer.transmit_epr_source_capabilities(&caps).await,
+            Err(ProtocolError::TxError(TxError::ChunkedTransmissionFailed))
+        ));
+        let message = protocol_layer.receive_message().await.unwrap();
+        assert_eq!(message.header.message_id(), 4);
     }
 }

@@ -9,7 +9,7 @@ use std::vec::Vec;
 pub use epr::{
     DUMMY_EPR_SOURCE_CAPS_CHUNK_0, DUMMY_EPR_SOURCE_CAPS_CHUNK_1, DUMMY_SPR_CAPS_EPR_CAPABLE, DummySinkEprDevice,
 };
-use usbpd_traits::Driver;
+use usbpd_traits::{Driver, DriverRxError, RxFrame, Sop};
 
 use crate::SwapType;
 use crate::protocol_layer::message::data::request::{self, PowerSource};
@@ -114,8 +114,8 @@ impl Timer for DummyTimer {
 
 /// A dummy driver for testing.
 pub struct DummyDriver<const N: usize> {
-    rx_vec: Vec<heapless::Vec<u8, N>>,
-    tx_vec: Vec<heapless::Vec<u8, N>>,
+    rx_vec: Vec<Result<(Sop, heapless::Vec<u8, N>), DriverRxError>>,
+    tx_vec: Vec<(Sop, heapless::Vec<u8, N>)>,
 }
 
 impl<const N: usize> Default for DummyDriver<N> {
@@ -133,16 +133,31 @@ impl<const N: usize> DummyDriver<N> {
         Self::default()
     }
 
-    /// Inject received data that can be retrieved later.
+    /// Inject received SOP data that can be retrieved later.
     pub fn inject_received_data(&mut self, data: &[u8]) {
+        self.inject_received_sop_data(Sop::Sop, data);
+    }
+
+    /// Inject received data with a given SOP.
+    pub fn inject_received_sop_data(&mut self, sop: Sop, data: &[u8]) {
         let mut vec = heapless::Vec::new();
         vec.extend_from_slice(data).unwrap();
 
-        self.rx_vec.push(vec);
+        self.rx_vec.push(Ok((sop, vec)));
+    }
+
+    /// Inject a receive error, e.g. a detach.
+    pub fn inject_receive_error(&mut self, error: DriverRxError) {
+        self.rx_vec.push(Err(error));
     }
 
     /// Probe data that was transmitted by the stack.
     pub fn probe_transmitted_data(&mut self) -> heapless::Vec<u8, N> {
+        self.probe_transmitted_sop_data().1
+    }
+
+    /// Probe data that was transmitted by the stack, with its SOP.
+    pub fn probe_transmitted_sop_data(&mut self) -> (Sop, heapless::Vec<u8, N>) {
         eprintln!("probe_transmitted_data called, tx_vec len: {}", self.tx_vec.len());
         self.tx_vec.remove(0)
     }
@@ -154,23 +169,23 @@ impl<const N: usize> DummyDriver<N> {
 }
 
 impl<const N: usize> Driver for DummyDriver<N> {
-    async fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, usbpd_traits::DriverRxError> {
+    async fn receive(&mut self, buffer: &mut [u8]) -> Result<RxFrame, DriverRxError> {
         // If no data available, wait indefinitely (like real hardware would)
         if self.rx_vec.is_empty() {
             pending().await
         }
 
-        let first = self.rx_vec.remove(0);
+        let (sop, first) = self.rx_vec.remove(0)?;
         let len = first.len();
         buffer[..len].copy_from_slice(&first);
 
-        Ok(len)
+        Ok(RxFrame { sop, len })
     }
 
-    async fn transmit(&mut self, data: &[u8]) -> Result<(), usbpd_traits::DriverTxError> {
+    async fn transmit(&mut self, sop: Sop, data: &[u8]) -> Result<(), usbpd_traits::DriverTxError> {
         let mut vec = heapless::Vec::new();
         vec.extend_from_slice(data).unwrap();
-        self.tx_vec.push(vec);
+        self.tx_vec.push((sop, vec));
 
         Ok(())
     }

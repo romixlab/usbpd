@@ -10,6 +10,7 @@ mod epr_messages_test;
 
 use byteorder::{ByteOrder, LittleEndian};
 use header::{Header, MessageType};
+pub use usbpd_traits::Sop;
 
 use crate::protocol_layer::message::extended::ExtendedHeader;
 
@@ -84,12 +85,27 @@ pub struct Message {
     pub header: Header,
     /// Optional payload for  messages.
     pub payload: Option<Payload>,
+    /// The SOP the message was received with, or is to be sent with.
+    ///
+    /// Defaults to [`Sop::Sop`]; the protocol layer sets it on received messages.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub sop: Sop,
 }
 
 impl Message {
     /// Create a new message from a message header.
     pub fn new(header: Header) -> Self {
-        Self { header, payload: None }
+        Self {
+            header,
+            payload: None,
+            sop: Sop::Sop,
+        }
+    }
+
+    /// Set the SOP the message is sent with.
+    pub fn with_sop(mut self, sop: Sop) -> Self {
+        self.sop = sop;
+        self
     }
 
     /// Create a new message from a message header and payload data.
@@ -97,6 +113,7 @@ impl Message {
         Self {
             header,
             payload: Some(Payload::Data(data)),
+            sop: Sop::Sop,
         }
     }
 
