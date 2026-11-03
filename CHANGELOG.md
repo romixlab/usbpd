@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Our fork (romixlab/usbpd) for Donguru, typec_dongle FW-59. The API breaks on purpose.
 
+### Versions
+
+- Both crates move to one workspace version on a forked line, 100.0.0, so they never collide with elagil's crates.io releases. Dependents patch them in with `usbpd = "100"` and `usbpd-traits = "100"` (typec_dongle today asks for `"3.0.0"` and `"2.0.0"`; our embassy fork's `usbpd-traits` requirement changes too).
+
 ### `usbpd-traits`: changed (breaking)
 
 - `Driver::receive` returns an `RxFrame { sop, len }` and `Driver::transmit` takes a `Sop` (`usbpd PRL-1 sop-aware-messaging`). A driver that only handles SOP returns `Sop::Sop` and ignores the argument; our embassy fork's UCPD driver has to follow.

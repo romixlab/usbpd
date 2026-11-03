@@ -1,6 +1,6 @@
 [package]
 name = "usbpd"
-version = "3.1.0"
+version.workspace = true
 description = "USB-PD library for `[no_std]`."
 documentation = "https://docs.rs/usbpd"
 readme = "README.md"

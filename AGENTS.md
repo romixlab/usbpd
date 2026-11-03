@@ -38,6 +38,12 @@ Each change gets a line under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md), wi
 
 Host tests run against `DummyDriver` and `DummyTimer`: inject received frames (with their SOP), run a policy engine step, then check the transmitted frames. Test data is our own or captured from our own hardware.
 
+## Versions
+
+- Both crates share one version, `[workspace.package] version`, on a forked line that starts at **100.0.0**. Major 100 cannot collide with elagil's crates.io releases (usbpd 3.x, usbpd-traits 2.x), and `tpm land` bumps semver from it (a breaking change gives 101.0.0, and so on).
+- Dependents use the fork through `[patch.crates-io]`, with a requirement on the fork line (`usbpd = "100"`, `usbpd-traits = "100"`). A patch is only used when its version matches the requirement, so a dependent still asking for `"3"` or `"2"` silently gets crates.io instead.
+- The `## [3.1.0]` and older sections in CHANGELOG.md are upstream's releases, kept as history.
+
 ## Commits
 
 Conventional commits (`feat:`, `fix:`, `chore:`), `!` for breaking changes. No version bumps on session branches; `tpm land` releases.

@@ -1,6 +1,6 @@
 [package]
 name = "usbpd-traits"
-version = "2.0.0"
+version.workspace = true
 description = "USB-PD library traits."
 documentation = "https://docs.rs/usbpd-traits"
 readme = "README.md"
