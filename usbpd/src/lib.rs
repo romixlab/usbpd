@@ -17,7 +17,9 @@
 //!   - a Programmable Power Supply (PPS), and
 //!   - an Adjustable Voltage Supply (AVS),
 //! - SPR and EPR source mode, and
-//! - dual-role port (DRP) support.
+//! - dual-role port (DRP) support,
+//! - SOP-aware messaging (SOP, SOP', SOP'') with message IDs per SOP, and
+//! - vendor defined messages (VDM) forwarded to the device policy manager (see [`vdm`]).
 //!
 
 #![cfg_attr(not(test), no_std)]
@@ -35,6 +37,7 @@ pub mod protocol_layer;
 pub mod sink;
 pub mod source;
 pub mod timers;
+pub mod vdm;
 
 #[cfg(test)]
 #[allow(missing_docs)] // FIXME: Docs for the dummy?

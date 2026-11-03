@@ -133,13 +133,15 @@ impl Data {
                     Data::EprMode(epr_mode::EprModeDataObject(LittleEndian::read_u32(payload)))
                 }
             }
-            DataMessageType::VendorDefined => match vendor_defined::VendorDefined::parse(payload, message.header.num_objects()) {
-                Some(vdm) => {
-                    trace!("VDM RX: {:?}", vdm);
-                    Data::VendorDefined(vdm)
+            DataMessageType::VendorDefined => {
+                match vendor_defined::VendorDefined::parse(payload, message.header.num_objects()) {
+                    Some(vdm) => {
+                        trace!("VDM RX: {:?}", vdm);
+                        Data::VendorDefined(vdm)
+                    }
+                    None => Data::Unknown,
                 }
-                None => Data::Unknown,
-            },
+            }
             _ => {
                 warn!("Unhandled message type");
                 Data::Unknown

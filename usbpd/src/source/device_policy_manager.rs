@@ -7,10 +7,11 @@ use core::future::Future;
 use crate::protocol_layer::message::data::request;
 use crate::protocol_layer::message::data::sink_capabilities::SinkCapabilities;
 use crate::protocol_layer::message::data::source_capabilities::SourceCapabilities;
+use crate::vdm::{Sop, VdmDevicePolicyManager, VendorDefined};
 use crate::{DataRole, SwapType};
 
 /// Events that the device policy manager can send to the policy engine.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Empty event.
     None,
@@ -32,6 +33,8 @@ pub enum Event {
     RequestDataRoleSwap,
     /// DRP Indicate a power role swap needs to be done
     RequestPowerRoleSwap,
+    /// Send a VDM on the given SOP. A response arrives through [`VdmDevicePolicyManager::vdm_received`].
+    SendVdm(Sop, VendorDefined),
 }
 
 #[derive(Debug)]
@@ -69,12 +72,15 @@ pub use crate::source::epr_device_policy_manager::EprDevicePolicyManager;
 /// Full implementation for the source device policy manager.
 /// The default implementations of the traits will handle the case where a feature is unsupported.
 #[cfg(feature = "epr")]
-pub trait SourceDpm: DevicePolicyManager + EprDevicePolicyManager + DrpDevicePolicyManager {}
+pub trait SourceDpm:
+    DevicePolicyManager + EprDevicePolicyManager + DrpDevicePolicyManager + VdmDevicePolicyManager
+{
+}
 
 /// Full implementation for the source device policy manager.
 /// The default implementations of the traits will handle the case where a feature is unsupported.
 #[cfg(not(feature = "epr"))]
-pub trait SourceDpm: DevicePolicyManager + DrpDevicePolicyManager {}
+pub trait SourceDpm: DevicePolicyManager + DrpDevicePolicyManager + VdmDevicePolicyManager {}
 
 /// Trait for the device policy manager.
 ///

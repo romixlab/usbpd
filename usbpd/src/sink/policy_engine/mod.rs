@@ -23,6 +23,7 @@ use crate::protocol_layer::message::header::{
 };
 use crate::protocol_layer::{ProtocolError, RxError, SinkProtocolLayer, TxError};
 use crate::timers::{Timer, TimerType};
+use crate::vdm::{Sop, VdmResponse, VendorDefined};
 use crate::{Contract, DataRole, PolicyEngineResult, PowerRole, RunResult, SwapType};
 
 #[cfg(test)]
@@ -78,6 +79,10 @@ enum State {
     /// EPR states
     #[cfg(feature = "epr")]
     EprMode(EprState),
+    /// A VDM was received and goes to the DPM.
+    ReceivedVdm(Sop, VendorDefined),
+    /// Send a VDM, from the DPM.
+    SendVdm(Sop, VendorDefined),
     /// Custom state to signal exit out of sink to source from a power swap
     PrSwapToSourceStartup,
     ErrorRecovery,
@@ -360,6 +365,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SinkDpm> Sink<DRIVER, TIMER, DPM> {
 
                     // Per PD 3.2 Sec. 6.6.9.1: Transmission failure (no GoodCRC after retries) triggers Soft Reset.
                     // Note: If we're in SoftReset/SendSoftReset state, this is caught above and escalates to Hard Reset.
+                    // A VDM to a cable plug that nobody acknowledged: there is no such cable plug. Not a reason to
+                    // soft reset the port partner.
+                    (_, State::SendVdm(sop, _), ProtocolError::TransmitRetriesExceeded(_)) if sop.is_cable() => {
+                        self.device_policy_manager.vdm_not_sent(*sop).await;
+                        Some(State::Ready(false))
+                    }
+
                     (_, _, ProtocolError::TransmitRetriesExceeded(_)) => Some(State::SendSoftReset),
 
                     // Unhandled protocol errors - log and continue.
@@ -556,6 +568,15 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SinkDpm> Sink<DRIVER, TIMER, DPM> {
                         let message = message?;
 
                         match message.header.message_type() {
+                            // Cable traffic: only VDMs go up, to the DPM.
+                            _ if message.sop != Sop::Sop => match message.payload {
+                                Some(Payload::Data(Data::VendorDefined(vdm))) => State::ReceivedVdm(message.sop, vdm),
+                                _ => State::Ready(*after_wait),
+                            },
+                            MessageType::Data(DataMessageType::VendorDefined) => match message.payload {
+                                Some(Payload::Data(Data::VendorDefined(vdm))) => State::ReceivedVdm(Sop::Sop, vdm),
+                                _ => State::SendNotSupported,
+                            },
                             MessageType::Data(DataMessageType::SourceCapabilities) => {
                                 // Per PD 3.2 Sec. 8.3.3.3.8:
                                 // In EPR Mode, if a Source_Capabilities Message is received that
@@ -665,6 +686,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SinkDpm> Sink<DRIVER, TIMER, DPM> {
                         }
                         Event::RequestPowerRoleSwap => State::DrpSwap(SwapState::Power(PowerRoleSwap::Send)),
                         Event::RequestDataRoleSwap => State::DrpSwap(SwapState::Data(DataRoleSwap::Send)),
+                        Event::SendVdm(sop, vdm) => State::SendVdm(sop, vdm),
                         Event::None => State::Ready(false),
                     },
                     // Timer timeout handling
@@ -680,6 +702,18 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SinkDpm> Sink<DRIVER, TIMER, DPM> {
                         Either3::Third(_) => State::SelectCapability(power_source),
                     },
                 }
+            }
+            State::ReceivedVdm(sop, vdm) => {
+                let sop = *sop;
+                match self.device_policy_manager.vdm_received(sop, vdm).await {
+                    VdmResponse::Reply(reply) => State::SendVdm(sop, reply),
+                    VdmResponse::NotSupported if sop == Sop::Sop => State::SendNotSupported,
+                    VdmResponse::NotSupported | VdmResponse::Ignore => State::Ready(false),
+                }
+            }
+            State::SendVdm(sop, vdm) => {
+                self.protocol_layer.transmit_vdm(*sop, vdm.clone()).await?;
+                State::Ready(false)
             }
             State::SendNotSupported => {
                 self.protocol_layer

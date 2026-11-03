@@ -667,3 +667,214 @@ async fn test_detach_exits_and_resets() {
     policy_engine.run_step().await.unwrap(); // `WaitForCapabilities` -> `EvaluateCapabilities`
     assert!(matches!(policy_engine.state, State::EvaluateCapabilities(_)));
 }
+
+mod vdm {
+    use usbpd_traits::Sop;
+
+    use super::*;
+    use crate::Contract;
+    use crate::dummy::get_source_capability_request;
+    use crate::protocol_layer::message::data::source_capabilities::SourceCapabilities;
+    use crate::sink::device_policy_manager::{
+        DevicePolicyManager, DrpDevicePolicyManager, EprDevicePolicyManager, Event,
+    };
+    use crate::vdm::{
+        PD_SID, VdmCommand, VdmCommandType, VdmDevicePolicyManager, VdmHeader, VdmHeaderStructured, VdmResponse,
+        VendorDefined,
+    };
+
+    /// A sink DPM that records VDMs and answers Discover Identity requests.
+    #[derive(Default)]
+    struct VdmSink {
+        received: std::vec::Vec<(Sop, VendorDefined)>,
+        not_sent: std::vec::Vec<Sop>,
+        event: Option<Event>,
+    }
+
+    impl DevicePolicyManager for VdmSink {
+        async fn get_event(&mut self, _source_capabilities: &SourceCapabilities) -> Event {
+            match self.event.take() {
+                Some(event) => event,
+                None => core::future::pending().await,
+            }
+        }
+    }
+    impl DrpDevicePolicyManager for VdmSink {}
+    impl EprDevicePolicyManager for VdmSink {}
+    impl SinkDpm for VdmSink {}
+
+    impl VdmDevicePolicyManager for VdmSink {
+        async fn vdm_received(&mut self, sop: Sop, vdm: &VendorDefined) -> VdmResponse {
+            self.received.push((sop, vdm.clone()));
+            match vdm.structured() {
+                Some(header)
+                    if header.command() == VdmCommand::DiscoverIdentity
+                        && header.command_type() == VdmCommandType::InitiatorREQ =>
+                {
+                    VdmResponse::Reply(VendorDefined::new(
+                        VdmHeader::Structured(header.response(VdmCommandType::ResponderACK)),
+                        &[0x1234, 0, 0],
+                    ))
+                }
+                _ => VdmResponse::Ignore,
+            }
+        }
+
+        async fn vdm_not_sent(&mut self, sop: Sop) {
+            self.not_sent.push(sop);
+        }
+    }
+
+    fn discover_identity(command_type: VdmCommandType) -> VendorDefined {
+        VendorDefined::new(
+            VdmHeader::Structured(VdmHeaderStructured::new(
+                PD_SID,
+                VdmCommand::DiscoverIdentity,
+                command_type,
+            )),
+            &[],
+        )
+    }
+
+    /// Serialized VDM from the source on any SOP.
+    fn vdm_bytes(vdm: &VendorDefined, message_id: u8) -> heapless::Vec<u8, MAX_DATA_MESSAGE_SIZE> {
+        let header = Header::new_data(
+            get_source_header_template(),
+            Counter::new_from_value(CounterType::MessageId, message_id),
+            DataMessageType::VendorDefined,
+            vdm.num_objects(),
+        );
+        let mut buf = [0u8; MAX_DATA_MESSAGE_SIZE];
+        let len = Message::new_with_data(header, Data::VendorDefined(vdm.clone())).to_bytes(&mut buf);
+        heapless::Vec::from_slice(&buf[..len]).unwrap()
+    }
+
+    fn sink_in_ready<DPM: SinkDpm>(dpm: DPM) -> Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, DPM> {
+        let mut policy_engine = Sink::new(DummyDriver::new(), dpm);
+        policy_engine.source_capabilities = Some(SourceCapabilities(
+            heapless::Vec::from_slice(&crate::dummy::get_dummy_source_capabilities()).unwrap(),
+        ));
+        policy_engine.contract = Contract::Explicit(get_source_capability_request());
+        policy_engine.state = State::Ready(false);
+        policy_engine
+    }
+
+    fn transmitted(
+        policy_engine: &mut Sink<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, impl SinkDpm>,
+    ) -> (Sop, Message) {
+        let (sop, data) = policy_engine.protocol_layer.driver().probe_transmitted_sop_data();
+        (sop, Message::from_bytes(&data).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_vdm_request_goes_to_dpm_and_is_answered() {
+        let mut policy_engine = sink_in_ready(VdmSink::default());
+        let request = discover_identity(VdmCommandType::InitiatorREQ);
+        policy_engine
+            .protocol_layer
+            .driver()
+            .inject_received_data(&vdm_bytes(&request, 3));
+
+        // `Ready` -> `ReceivedVdm` -> `SendVdm`
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::ReceivedVdm(Sop::Sop, _)));
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::SendVdm(Sop::Sop, _)));
+        assert_eq!(policy_engine.device_policy_manager.received, [(Sop::Sop, request)]);
+
+        // `SendVdm` -> `Ready`
+        simulate_source_control_message(&mut policy_engine, ControlMessageType::GoodCRC, 0);
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::Ready(false)));
+
+        let (_, good_crc) = transmitted(&mut policy_engine);
+        assert_eq!(
+            good_crc.header.message_type(),
+            MessageType::Control(ControlMessageType::GoodCRC)
+        );
+        let (sop, reply) = transmitted(&mut policy_engine);
+        assert_eq!(sop, Sop::Sop);
+        let Some(Payload::Data(Data::VendorDefined(reply))) = reply.payload else {
+            panic!("expected a VDM, got {:?}", reply);
+        };
+        assert_eq!(reply.structured().unwrap().command_type(), VdmCommandType::ResponderACK);
+        assert_eq!(&reply.vdos[..], &[0x1234, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_vdm_default_dpm_answers_not_supported() {
+        let mut policy_engine = sink_in_ready(DummySinkDevice {});
+        policy_engine
+            .protocol_layer
+            .driver()
+            .inject_received_data(&vdm_bytes(&discover_identity(VdmCommandType::InitiatorREQ), 3));
+
+        policy_engine.run_step().await.unwrap();
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::SendNotSupported));
+    }
+
+    #[tokio::test]
+    async fn test_cable_vdm_goes_to_dpm_other_cable_traffic_is_ignored() {
+        let mut policy_engine = sink_in_ready(VdmSink::default());
+        let response = discover_identity(VdmCommandType::ResponderACK);
+        let accept = {
+            let mut buf = [0u8; 2];
+            Message::new(Header::new_control(
+                get_source_header_template(),
+                Counter::new_from_value(CounterType::MessageId, 1),
+                ControlMessageType::Accept,
+            ))
+            .to_bytes(&mut buf);
+            buf
+        };
+        let driver = policy_engine.protocol_layer.driver();
+        driver.inject_received_sop_data(Sop::SopPrime, &accept);
+        driver.inject_received_sop_data(Sop::SopPrime, &vdm_bytes(&response, 2));
+
+        // The SOP' Accept leaves the sink in `Ready`.
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::Ready(false)));
+
+        // The SOP' VDM goes to the DPM, which ignores the response.
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::ReceivedVdm(Sop::SopPrime, _)));
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::Ready(false)));
+        assert_eq!(
+            policy_engine.device_policy_manager.received,
+            [(Sop::SopPrime, response)]
+        );
+
+        // Both were acknowledged on SOP'.
+        assert_eq!(transmitted(&mut policy_engine).0, Sop::SopPrime);
+        assert_eq!(transmitted(&mut policy_engine).0, Sop::SopPrime);
+        assert!(!policy_engine.protocol_layer.driver().has_transmitted_data());
+    }
+
+    #[tokio::test]
+    async fn test_unacknowledged_cable_vdm_does_not_soft_reset() {
+        let request = discover_identity(VdmCommandType::InitiatorREQ);
+        let mut policy_engine = sink_in_ready(VdmSink {
+            event: Some(Event::SendVdm(Sop::SopPrime, request.clone())),
+            ..Default::default()
+        });
+
+        // `Ready` -> `SendVdm`; nobody answers on SOP'.
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::SendVdm(Sop::SopPrime, _)));
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::Ready(false)));
+        assert_eq!(policy_engine.device_policy_manager.not_sent, [Sop::SopPrime]);
+
+        // Sent once plus the retries, all on SOP'.
+        let mut count = 0;
+        while policy_engine.protocol_layer.driver().has_transmitted_data() {
+            let (sop, message) = transmitted(&mut policy_engine);
+            assert_eq!(sop, Sop::SopPrime);
+            assert!(matches!(message.payload, Some(Payload::Data(Data::VendorDefined(_)))));
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+}

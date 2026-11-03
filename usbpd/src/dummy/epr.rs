@@ -106,6 +106,7 @@ impl SinkDPM for DummySinkEprDevice {
 impl SinkDrpDPM for DummySinkEprDevice {}
 impl SinkEprDPM for DummySinkEprDevice {}
 impl SinkDpm for DummySinkEprDevice {}
+impl crate::vdm::VdmDevicePolicyManager for DummySinkEprDevice {}
 
 /// Empty EPR DPM impls for the SPR-only dummies.
 impl SinkEprDPM for DummySinkDevice {}

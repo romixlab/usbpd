@@ -546,7 +546,10 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 &data[start..end],
                 &mut buffer,
             );
-            trace!("Transmit chunk {} of {} for {:?}", chunk_number, chunk_count, message_type);
+            trace!(
+                "Transmit chunk {} of {} for {:?}",
+                chunk_number, chunk_count, message_type
+            );
             self.transmit_frame(sop, &buffer[..size]).await?;
 
             if chunk_number + 1 == chunk_count {
@@ -594,10 +597,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
                 let Ok(header) = Header::from_bytes(&buffer[..MSG_HEADER_SIZE]) else {
                     continue;
                 };
-                if matches!(
-                    header.message_type(),
-                    MessageType::Control(ControlMessageType::GoodCRC)
-                ) {
+                if matches!(header.message_type(), MessageType::Control(ControlMessageType::GoodCRC)) {
                     continue;
                 }
 
@@ -1133,6 +1133,23 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         }
     }
 
+    /// Transmit a `Vendor_Defined` message on `sop`.
+    pub async fn transmit_vdm(
+        &mut self,
+        sop: Sop,
+        vdm: message::data::vendor_defined::VendorDefined,
+    ) -> Result<(), ProtocolError> {
+        let header = Header::new_data(
+            self.default_header,
+            self.tx_counter(),
+            DataMessageType::VendorDefined,
+            vdm.num_objects(),
+        );
+
+        self.transmit(Message::new_with_data(header, Data::VendorDefined(vdm)).with_sop(sop))
+            .await
+    }
+
     /// Transmit sink capabilities in response to Get_Sink_Cap.
     ///
     /// Per PD 3.2 Sec. 6.4.1.6, sinks respond to Get_Sink_Cap messages
@@ -1586,12 +1603,20 @@ mod tests {
         assert_eq!(third.header.message_id(), 4);
 
         // Every frame, the retransmission too, was acknowledged on its own SOP.
-        let expected = [(Sop::Sop, 3), (Sop::SopPrime, 3), (Sop::SopPrime, 3), (Sop::SopPrime, 4)];
+        let expected = [
+            (Sop::Sop, 3),
+            (Sop::SopPrime, 3),
+            (Sop::SopPrime, 3),
+            (Sop::SopPrime, 4),
+        ];
         for (sop, message_id) in expected {
             let (tx_sop, frame) = protocol_layer.driver.probe_transmitted_sop_data();
             let ack = super::message::Message::from_bytes(&frame).unwrap();
             assert_eq!(tx_sop, sop);
-            assert_eq!(ack.header.message_type(), MessageType::Control(ControlMessageType::GoodCRC));
+            assert_eq!(
+                ack.header.message_type(),
+                MessageType::Control(ControlMessageType::GoodCRC)
+            );
             assert_eq!(ack.header.message_id(), message_id);
         }
         assert!(!protocol_layer.driver.has_transmitted_data());
@@ -1796,7 +1821,10 @@ mod tests {
         assert_eq!(&chunk_0[..], &DUMMY_EPR_SOURCE_CAPS_CHUNK_0[..]);
         // GoodCRC for the chunk request.
         let ack = protocol_layer.driver.probe_transmitted_data();
-        assert_eq!(super::message::Message::from_bytes(&ack).unwrap().header.message_id(), 2);
+        assert_eq!(
+            super::message::Message::from_bytes(&ack).unwrap().header.message_id(),
+            2
+        );
         let chunk_1 = protocol_layer.driver.probe_transmitted_data();
         assert_eq!(&chunk_1[..], &DUMMY_EPR_SOURCE_CAPS_CHUNK_1[..]);
         assert!(!protocol_layer.driver.has_transmitted_data());

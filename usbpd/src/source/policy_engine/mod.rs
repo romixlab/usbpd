@@ -26,6 +26,7 @@ use crate::protocol_layer::message::header::{
 use crate::protocol_layer::message::{Message, Payload};
 use crate::protocol_layer::{ProtocolError, RxError, SourceProtocolLayer, TxError};
 use crate::timers::{Timer, TimerType};
+use crate::vdm::{Sop, VdmResponse, VendorDefined};
 use crate::{Contract, DataRole, PolicyEngineResult, PowerRole, RunResult, SwapType};
 
 #[cfg(test)]
@@ -98,6 +99,10 @@ pub(crate) enum State {
     /// 8.3.3.26 EPR States
     #[cfg(feature = "epr")]
     EprMode(EprState),
+    /// A VDM was received and goes to the DPM.
+    ReceivedVdm(Sop, VendorDefined),
+    /// Send a VDM, from the DPM.
+    SendVdm(Sop, VendorDefined),
     /// Custom state to signal exit out of source to sink from a power swap
     PrSwapToSinkStartup,
     ErrorRecovery,
@@ -360,6 +365,13 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
 
                     // Per PD 3.2 Sec. 6.6.9.1: Transmission failure (no GoodCRC after retries) triggers Soft Reset.
                     // Note: If we're in SoftReset/SendSoftReset state, this is caught above and escalates to Hard Reset.
+                    // A VDM to a cable plug that nobody acknowledged: there is no such cable plug. Not a reason to
+                    // soft reset the port partner.
+                    (_, State::SendVdm(sop, _), ProtocolError::TransmitRetriesExceeded(_)) if sop.is_cable() => {
+                        self.device_policy_manager.vdm_not_sent(*sop).await;
+                        Some(State::Ready)
+                    }
+
                     (_, _, ProtocolError::TransmitRetriesExceeded(_)) => Some(State::SendSoftReset),
 
                     // Unhandled protocol errors - log and continue.
@@ -568,6 +580,7 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
                         },
                         Event::RequestDataRoleSwap => State::DrpSwap(SwapState::Data(DataRoleSwap::Send)),
                         Event::RequestPowerRoleSwap => State::DrpSwap(SwapState::Power(PowerRoleSwap::Send)),
+                        Event::SendVdm(sop, vdm) => State::SendVdm(sop, vdm),
                     },
 
                     Either3::Third(timeout_source) => match timeout_source {
@@ -813,6 +826,18 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
 
             // PD 3.2 Sec. 8.3.3.6 Not Supported Message
             // PD 3.2 Sec. 8.3.3.6.1.1 (PE_SRC_Not_Supported):
+            State::ReceivedVdm(sop, vdm) => {
+                let sop = *sop;
+                match self.device_policy_manager.vdm_received(sop, vdm).await {
+                    VdmResponse::Reply(reply) => State::SendVdm(sop, reply),
+                    VdmResponse::NotSupported if sop == Sop::Sop => State::SendNotSupported,
+                    VdmResponse::NotSupported | VdmResponse::Ignore => State::Ready,
+                }
+            }
+            State::SendVdm(sop, vdm) => {
+                self.protocol_layer.transmit_vdm(*sop, vdm.clone()).await?;
+                State::Ready
+            }
             State::SendNotSupported => {
                 self.protocol_layer
                     .transmit_control_message(ControlMessageType::NotSupported)
@@ -1233,7 +1258,19 @@ impl<DRIVER: Driver, TIMER: Timer, DPM: SourceDpm> Source<DRIVER, TIMER, DPM> {
     }
 
     async fn match_message_to_state(&mut self, message: Message) -> Result<State, Error> {
+        // Cable traffic: only VDMs go up, to the DPM.
+        if message.sop != Sop::Sop {
+            return Ok(match message.payload {
+                Some(Payload::Data(Data::VendorDefined(vdm))) => State::ReceivedVdm(message.sop, vdm),
+                _ => State::Ready,
+            });
+        }
+
         let state = match message.header.message_type() {
+            MessageType::Data(DataMessageType::VendorDefined) => match message.payload {
+                Some(Payload::Data(Data::VendorDefined(vdm))) => State::ReceivedVdm(Sop::Sop, vdm),
+                _ => State::SendNotSupported,
+            },
             MessageType::Data(DataMessageType::Request) => {
                 if self.mode != Mode::Spr {
                     return Err(Error::Protocol(ProtocolError::RxError(RxError::HardReset)));

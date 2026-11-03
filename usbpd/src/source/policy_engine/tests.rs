@@ -628,3 +628,96 @@ async fn test_detach_exits_and_resets() {
     assert!(matches!(policy_engine.run().await, Ok(RunResult::Detached)));
     assert!(matches!(policy_engine.state, State::Startup { role_swap: false }));
 }
+
+mod vdm {
+    use usbpd_traits::Sop;
+
+    use super::*;
+    use crate::protocol_layer::message::Payload;
+    #[cfg(feature = "epr")]
+    use crate::source::device_policy_manager::EprDevicePolicyManager;
+    use crate::source::device_policy_manager::{DevicePolicyManager, DrpDevicePolicyManager};
+    use crate::vdm::{
+        PD_SID, VdmCommand, VdmCommandType, VdmDevicePolicyManager, VdmHeader, VdmHeaderStructured, VdmResponse,
+        VendorDefined,
+    };
+
+    /// A source DPM that NAKs every structured VDM request and records what it saw.
+    #[derive(Default)]
+    struct VdmSource {
+        received: std::vec::Vec<(Sop, VendorDefined)>,
+    }
+
+    impl DevicePolicyManager for VdmSource {
+        async fn evaluate_request(&mut self, _request: &PowerSource) -> CapabilityResponse {
+            CapabilityResponse::Accept
+        }
+
+        fn source_capabilities(&mut self) -> SourceCapabilities {
+            SourceCapabilities(heapless::Vec::from_slice(get_dummy_source_capabilities().as_slice()).unwrap())
+        }
+    }
+    impl DrpDevicePolicyManager for VdmSource {}
+    #[cfg(feature = "epr")]
+    impl EprDevicePolicyManager for VdmSource {}
+    impl SourceDpm for VdmSource {}
+
+    impl VdmDevicePolicyManager for VdmSource {
+        async fn vdm_received(&mut self, sop: Sop, vdm: &VendorDefined) -> VdmResponse {
+            self.received.push((sop, vdm.clone()));
+            match vdm.structured() {
+                Some(header) if header.command_type() == VdmCommandType::InitiatorREQ => {
+                    VdmResponse::Reply(VendorDefined::new(
+                        VdmHeader::Structured(header.response(VdmCommandType::ResponderNAK)),
+                        &[],
+                    ))
+                }
+                _ => VdmResponse::Ignore,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vdm_request_goes_to_dpm_and_is_answered() {
+        let mut policy_engine: Source<DummyDriver<MAX_DATA_MESSAGE_SIZE>, DummyTimer, _> =
+            Source::new(DummyDriver::new(), VdmSource::default(), false);
+        policy_engine.state = State::Ready;
+
+        let request = VendorDefined::new(
+            VdmHeader::Structured(VdmHeaderStructured::new(
+                PD_SID,
+                VdmCommand::DiscoverSVIDS,
+                VdmCommandType::InitiatorREQ,
+            )),
+            &[],
+        );
+        let header = Header::new_data(
+            get_sink_header_template(),
+            Counter::new_from_value(CounterType::MessageId, 5),
+            DataMessageType::VendorDefined,
+            request.num_objects(),
+        );
+        let mut buf = [0u8; MAX_DATA_MESSAGE_SIZE];
+        let len = Message::new_with_data(header, Data::VendorDefined(request.clone())).to_bytes(&mut buf);
+        policy_engine.protocol_layer.driver().inject_received_data(&buf[..len]);
+
+        // `Ready` -> `ReceivedVdm` -> `SendVdm` -> `Ready`
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::ReceivedVdm(Sop::Sop, _)));
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::SendVdm(Sop::Sop, _)));
+        simulate_sink_control_message(&mut policy_engine, ControlMessageType::GoodCRC, 0);
+        policy_engine.run_step().await.unwrap();
+        assert!(matches!(policy_engine.state, State::Ready));
+        assert_eq!(policy_engine.device_policy_manager.received, [(Sop::Sop, request)]);
+
+        policy_engine.protocol_layer.driver().probe_transmitted_data(); // GoodCRC
+        let reply = Message::from_bytes(&policy_engine.protocol_layer.driver().probe_transmitted_data()).unwrap();
+        let Some(Payload::Data(Data::VendorDefined(reply))) = reply.payload else {
+            panic!("expected a VDM");
+        };
+        let header = reply.structured().unwrap();
+        assert_eq!(header.command(), VdmCommand::DiscoverSVIDS);
+        assert_eq!(header.command_type(), VdmCommandType::ResponderNAK);
+    }
+}

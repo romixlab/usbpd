@@ -24,6 +24,7 @@ use crate::source::device_policy_manager::{
     DrpDevicePolicyManager as SourceDrpDPM, SourceDpm,
 };
 use crate::timers::Timer;
+use crate::vdm::VdmDevicePolicyManager as VdmDPM;
 
 /// Maximum size of a non-extended USB PD message in bytes.
 /// Per PD 3.2, this is 2 bytes header + 7 data objects * 4 bytes = 30 bytes.
@@ -39,6 +40,7 @@ pub struct DummySinkDevice {}
 impl SinkDPM for DummySinkDevice {}
 impl SinkDrpDPM for DummySinkDevice {}
 impl SinkDpm for DummySinkDevice {}
+impl VdmDPM for DummySinkDevice {}
 
 /// A dummy capable of sourcing non-EPR power
 pub struct DummySourceDevice;
@@ -59,6 +61,7 @@ impl SourceDPM for DummySourceDevice {
 
 impl SourceDrpDPM for DummySourceDevice {}
 impl SourceDpm for DummySourceDevice {}
+impl VdmDPM for DummySourceDevice {}
 
 pub struct DummyDualRoleDevice;
 
@@ -90,6 +93,7 @@ impl SourceDrpDPM for DummyDualRoleDevice {
 }
 
 impl SourceDpm for DummyDualRoleDevice {}
+impl VdmDPM for DummyDualRoleDevice {}
 
 impl SinkDPM for DummyDualRoleDevice {}
 impl SinkDrpDPM for DummyDualRoleDevice {}

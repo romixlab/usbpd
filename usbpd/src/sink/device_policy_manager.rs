@@ -9,6 +9,7 @@ use crate::protocol_layer::message::data::{request, sink_capabilities, source_ca
 pub use crate::sink::epr_device_policy_manager::EprDevicePolicyManager;
 #[cfg(feature = "epr")]
 use crate::units::Power;
+use crate::vdm::{Sop, VdmDevicePolicyManager, VendorDefined};
 use crate::{DataRole, SwapType};
 
 /// Events that the device policy manager can send to the policy engine.
@@ -53,6 +54,8 @@ pub enum Event {
     /// DRP Indicate that a fast power role swap needs to be attempted
     /// due to the CC line going low
     FastPowerRoleSwap,
+    /// Send a VDM on the given SOP. A response arrives through [`VdmDevicePolicyManager::vdm_received`].
+    SendVdm(Sop, VendorDefined),
 }
 
 /// Information that the policy engine will publish to the DPM
@@ -73,12 +76,15 @@ pub enum Info {
 /// Full implementation for the sink device policy manager.
 /// The default implementations of the traits will handle the case where a feature is unsupported.
 #[cfg(feature = "epr")]
-pub trait SinkDpm: DevicePolicyManager + EprDevicePolicyManager + DrpDevicePolicyManager {}
+pub trait SinkDpm:
+    DevicePolicyManager + EprDevicePolicyManager + DrpDevicePolicyManager + VdmDevicePolicyManager
+{
+}
 
 /// Full implementation for the sink device policy manager.
 /// The default implementations of the traits will handle the case where a feature is unsupported.
 #[cfg(not(feature = "epr"))]
-pub trait SinkDpm: DevicePolicyManager + DrpDevicePolicyManager {}
+pub trait SinkDpm: DevicePolicyManager + DrpDevicePolicyManager + VdmDevicePolicyManager {}
 
 /// Trait for the device policy manager.
 ///

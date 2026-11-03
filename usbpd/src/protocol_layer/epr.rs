@@ -52,12 +52,7 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
 
     /// Transmit an EPR mode data message.
     pub async fn transmit_epr_mode(&mut self, action: epr_mode::Action, data: u8) -> Result<(), ProtocolError> {
-        let header = Header::new_data(
-            self.default_header,
-            self.tx_counter(),
-            DataMessageType::EprMode,
-            1,
-        );
+        let header = Header::new_data(self.default_header, self.tx_counter(), DataMessageType::EprMode, 1);
 
         let mdo = epr_mode::EprModeDataObject::default()
             .with_action(action)

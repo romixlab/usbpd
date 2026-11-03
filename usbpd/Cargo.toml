@@ -31,6 +31,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 default = ["epr"]
 
 log = ["dep:log"]
-defmt = ["dep:defmt", "heapless/defmt"]
+defmt = ["dep:defmt", "heapless/defmt", "usbpd-traits/defmt"]
 serde = ["dep:serde", "heapless/serde"]
 epr = []
