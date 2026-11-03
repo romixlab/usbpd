@@ -479,29 +479,16 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         trace!("Transmit message: {:?}", message);
 
         let sop = message.sop;
+
+        if let Some(Payload::Extended(extended)) = &message.payload {
+            let mut data = [0u8; MAX_EXTENDED_MSG_LEN];
+            let data_size = extended.to_bytes(&mut data);
+            return self.transmit_chunked(message.header, sop, &data[..data_size]).await;
+        }
+
+        message.header = self.stamp_header(message.header, sop);
         let mut buffer = Self::get_message_buffer();
-
-        let size = match &message.payload {
-            Some(Payload::Extended(extended)) => {
-                let mut data = [0u8; MAX_EXTENDED_MSG_LEN];
-                let data_size = extended.to_bytes(&mut data);
-                if data_size > MAX_EXTENDED_MSG_CHUNK_LEN {
-                    return self.transmit_chunked(message.header, sop, &data[..data_size]).await;
-                }
-                Self::chunk_to_bytes(
-                    self.stamp_header(message.header, sop),
-                    data_size,
-                    0,
-                    &data[..data_size],
-                    &mut buffer,
-                )
-            }
-            _ => {
-                message.header = self.stamp_header(message.header, sop);
-                message.to_bytes(&mut buffer)
-            }
-        };
-
+        let size = message.to_bytes(&mut buffer);
         self.transmit_frame(sop, &buffer[..size]).await
     }
 
@@ -523,7 +510,8 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         end
     }
 
-    /// Send an extended message of more than one chunk, per PD 3.2 Sec. 6.12.2.1.3 (Chunked Tx state machine).
+    /// Send an extended message in chunks of up to 26 bytes, per PD 3.2 Sec. 6.12.2.1.3 (Chunked Tx state machine).
+    /// A message that fits one chunk is a single frame.
     ///
     /// After each chunk but the last, the receiver must request the next one within tChunkSenderRequest.
     /// If no Chunk Request follows chunk 0, the partner does not do chunking and the message counts as sent
@@ -532,13 +520,14 @@ impl<DRIVER: Driver, TIMER: Timer> ProtocolLayer<DRIVER, TIMER> {
         let MessageType::Extended(message_type) = header.message_type() else {
             unreachable!("only extended messages are chunked");
         };
-        let chunk_count = data.len().div_ceil(MAX_EXTENDED_MSG_CHUNK_LEN);
+        let chunk_count = data.len().div_ceil(MAX_EXTENDED_MSG_CHUNK_LEN).max(1);
 
         for chunk_number in 0..chunk_count {
             let start = chunk_number * MAX_EXTENDED_MSG_CHUNK_LEN;
             let end = (start + MAX_EXTENDED_MSG_CHUNK_LEN).min(data.len());
 
-            let mut buffer = Self::get_message_buffer();
+            // A chunk frame is at most 30 bytes: header, extended header and 26 data bytes.
+            let mut buffer = [0u8; MSG_HEADER_SIZE + EXT_HEADER_SIZE + MAX_EXTENDED_MSG_CHUNK_LEN];
             let size = Self::chunk_to_bytes(
                 self.stamp_header(header, sop),
                 data.len(),
