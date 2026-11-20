@@ -1,6 +1,6 @@
 # Working on usbpd
 
-This is our fork of [elagil/usbpd](https://github.com/elagil/usbpd) (`origin` = romixlab/usbpd, `upstream` = elagil with pushes disabled). It is shaped for Donguru (typec_dongle), which uses it through `[patch.crates-io]`. The API may change or break whenever Donguru needs it; upstream compatibility is not a goal. Upstreaming a small, clean fix is a bonus and goes through the person, never directly from a session.
+This is our fork of [elagil/usbpd](https://github.com/elagil/usbpd) (`origin` = romixlab/usbpd, `upstream` = elagil with pushes disabled). It is shaped for Portwright (typec_dongle), which uses it through `[patch.crates-io]`. The API may change or break whenever Portwright needs it; upstream compatibility is not a goal. Upstreaming a small, clean fix is a bonus and goes through the person, never directly from a session.
 
 ## FEATURES.md is the source of truth
 

@@ -2,7 +2,7 @@
 
 This file is the single source of truth for what this usbpd fork does, what is broken and what is planned. [CHANGELOG.md](CHANGELOG.md) records what changed and when; this file records the current state.
 
-This repository is our fork of [elagil/usbpd](https://github.com/elagil/usbpd), shaped for Donguru (typec_dongle). Its API changes freely; upstream compatibility is not a goal. State as of 3 Nov 2026, based on upstream main `b1f0bb9`.
+This repository is our fork of [elagil/usbpd](https://github.com/elagil/usbpd), shaped for Portwright (typec_dongle). Its API changes freely; upstream compatibility is not a goal. State as of 3 Nov 2026, based on upstream main `b1f0bb9`.
 
 ## How to use this file
 
@@ -31,7 +31,7 @@ This repository is our fork of [elagil/usbpd](https://github.com/elagil/usbpd), 
   - one assembly at a time, not per SOP;
   - a multi-chunk message that starts while we wait for GoodCRC is not parked.
 - 📋 **PRL-5 PD 2.0 mode**: N_RETRY 3 and PD 2.0 behaviour toward a revision 2.0 partner.
-- 📋 **PRL-6 Collision avoidance**: SinkTxOk/SinkTxNG (Rp switching on the source, waiting on the sink), PD 3.2 Sec. 5.7. Donguru tracks it as typec_dongle FW-54.
+- 📋 **PRL-6 Collision avoidance**: SinkTxOk/SinkTxNG (Rp switching on the source, waiting on the sink), PD 3.2 Sec. 5.7. Portwright tracks it as typec_dongle FW-54.
 - 📋 **PRL-7 Cable plug role**: send SOP' and SOP'' messages as a cable plug (Cable Plug bit set), and send a Cable Reset. Needed for e-marker emulation (typec_dongle API-27).
 
 ## Vendor defined messages (`VDM`)
@@ -62,4 +62,4 @@ This repository is our fork of [elagil/usbpd](https://github.com/elagil/usbpd), 
 
 ## Observation (`OBS`)
 
-- 📋 **OBS-1 Observation hooks**: a tap on every sent and received frame (SOP, direction, outcome) and per-timer overrides, for Donguru's PD log and fault injection.
+- 📋 **OBS-1 Observation hooks**: a tap on every sent and received frame (SOP, direction, outcome) and per-timer overrides, for Portwright's PD log and fault injection.
