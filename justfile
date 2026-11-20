@@ -4,7 +4,7 @@ build:
 
 # Workspace tests; `just test --changed` tests only what changed against main
 test *flags:
-    if [ "{{flags}}" = "--changed" ]; then if command -v changedtests >/dev/null 2>&1; then f=$(changedtests) && if [ -n "$f" ]; then cargo nextest run --workspace -E "$f"; fi; else echo "changedtests not found; running the full test suite instead" >&2; {{just_executable()}} test-all; fi; else {{just_executable()}} test-all {{flags}}; fi
+    {{ if flags == "--changed" { "changedtests run" } else { just_executable() + " test-all " + flags } }}
 
 # All workspace tests: nextest, then the doctests
 test-all:
