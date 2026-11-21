@@ -30,6 +30,7 @@ serde = { version = "1.0.228", default-features = false }
 tokio = "1.49.0"
 
 [profile.dev]
+debug = false
 split-debuginfo = "unpacked"
 
 [profile.test]
