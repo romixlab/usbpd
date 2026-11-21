@@ -1,6 +1,6 @@
 # Working on usbpd
 
-This is our fork of [elagil/usbpd](https://github.com/elagil/usbpd) (`origin` = romixlab/usbpd, `upstream` = elagil with pushes disabled). It is shaped for Portwright (typec_dongle), which uses it through `[patch.crates-io]`. The API may change or break whenever Portwright needs it; upstream compatibility is not a goal. Upstreaming a small, clean fix is a bonus and goes through the person, never directly from a session.
+This is our fork of [elagil/usbpd](https://github.com/elagil/usbpd) (`origin` = romixlab/usbpd, `upstream` = elagil with pushes disabled). It is shaped for Portwright, which uses it through `[patch.crates-io]`. The API may change or break whenever Portwright needs it; upstream compatibility is not a goal. Upstreaming a small, clean fix is a bonus and goes through the person, never directly from a session.
 
 ## FEATURES.md is the source of truth
 
@@ -8,7 +8,7 @@ This is our fork of [elagil/usbpd](https://github.com/elagil/usbpd) (`origin` = 
 
 ## CHANGELOG.md records every change
 
-Each change gets a line under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md), with the FEATURES id where there is one. Breaking changes say what a downstream crate (typec_dongle, our embassy fork) has to change.
+Each change gets a line under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md), with the FEATURES id where there is one. Breaking changes say what a downstream crate (portwright, our embassy fork) has to change.
 
 ## Layout
 

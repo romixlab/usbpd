@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docs name the Portwright repo `portwright` (was `typec_dongle`, renamed).
+
 ## [100.0.0] - 2026-11-03
 
 Our fork (romixlab/usbpd) for Donguru, typec_dongle FW-59. The API breaks on purpose.
